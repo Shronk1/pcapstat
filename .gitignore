@@ -1,0 +1,13 @@
+# Build outputs
+bin/
+build/
+out/
+pcapstat_out/
+
+# Object and dependency files
+*.o
+*.d
+
+# Generated assets
+*.png
+*.pdf

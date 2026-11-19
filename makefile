@@ -1,79 +1,133 @@
-CC          := gcc
-APP_NAME    := pcapstat
+# ── pcapstat Makefile ─────────────────────────────────────────────────
+# C11 build with libpcap, cairo, and libm.
+# Output layout:  bin/  (executables)   build/{release,debug,asan,test}/  (*.o  *.d)
 
-SRC_DIR     := src
-INC_DIR     := include
-BUILD_DIR   := build
+# ── Toolchain ────────────────────────────────────────────────────────
+CC       := gcc
+CSTD     := -std=c11 -D_DEFAULT_SOURCE
+WARNINGS := -Wall -Wextra -Wpedantic -Wshadow
+DEPFLAGS := -MMD -MP
 
-# Tryb kompilacji: release (domyślny), debug lub asan
-MODE        ?= release
-OBJ_DIR     := $(BUILD_DIR)/$(MODE)
+PCAP_CFLAGS := $(shell pkg-config --cflags libpcap 2>/dev/null)
+PCAP_LIBS   := $(shell pkg-config --libs   libpcap 2>/dev/null || echo -lpcap)
 
-ifeq ($(MODE),release)
-	TARGET := $(APP_NAME)
-else
-	TARGET := $(APP_NAME)-$(MODE)
-endif
+CAIRO_CFLAGS := $(shell pkg-config --cflags cairo)
+CAIRO_LIBS   := $(shell pkg-config --libs   cairo)
 
-SRCS        := $(wildcard $(SRC_DIR)/*.c)
-OBJS        := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
-DEPS        := $(OBJS:.o=.d)
+COMMON_CFLAGS := $(CSTD) $(WARNINGS) $(DEPFLAGS) $(PCAP_CFLAGS) $(CAIRO_CFLAGS)
+LIBS          := $(PCAP_LIBS) $(CAIRO_LIBS) -lm
 
-# Automatyczne flagi z pkg-config (z fallbackiem na standardowe nazwy bibliotek)
-CAIRO_CFLAGS := $(shell pkg-config --cflags cairo 2>/dev/null)
-CAIRO_LIBS   := $(shell pkg-config --libs cairo 2>/dev/null || echo "-lcairo")
-PCAP_CFLAGS  := $(shell pkg-config --cflags libpcap 2>/dev/null)
-PCAP_LIBS    := $(shell pkg-config --libs libpcap 2>/dev/null || echo "-lpcap")
+# ── Directories ──────────────────────────────────────────────────────
+SRCDIR   := src
+INCDIR   := include
+TESTDIR  := tests
+BINDIR   := bin
+BUILDDIR := build
 
-# -D_DEFAULT_SOURCE udostępnia typy BSD/POSIX wymagane przez libpcap i nagłówki sieciowe Linuksa
-BASE_CFLAGS  := -std=c11 -D_DEFAULT_SOURCE -I$(INC_DIR) \
-                -Wall -Wextra -Wpedantic -Wshadow \
-                -MMD -MP $(PCAP_CFLAGS) $(CAIRO_CFLAGS)
-LDFLAGS      := $(PCAP_LIBS) $(CAIRO_LIBS) -lm
+# Per-target build subdirectories (avoid object-file reuse across configs)
+BUILD_REL   := $(BUILDDIR)/release
+BUILD_DBG   := $(BUILDDIR)/debug
+BUILD_ASAN  := $(BUILDDIR)/asan
+BUILD_TEST  := $(BUILDDIR)/test
 
-ifeq ($(MODE),release)
-	CFLAGS := $(BASE_CFLAGS) -O2
-else ifeq ($(MODE),debug)
-	CFLAGS := $(BASE_CFLAGS) -g3 -O0 -DDEBUG
-else ifeq ($(MODE),asan)
-	CFLAGS  := $(BASE_CFLAGS) -g3 -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -DDEBUG
-	LDFLAGS += -fsanitize=address,undefined
-else
-	$(error Nieznany tryb MODE='$(MODE)'. Dostępne: release, debug, asan)
-endif
+# ── Source lists ─────────────────────────────────────────────────────
+SRCS     := $(wildcard $(SRCDIR)/*.c)
+LIB_SRCS := $(filter-out $(SRCDIR)/main.c,$(SRCS))
 
-.PHONY: all debug asan valgrind test clean
+TEST_SRCS := $(wildcard $(TESTDIR)/test_*.c)
+TEST_BINS := $(patsubst $(TESTDIR)/%.c,$(BINDIR)/%,$(TEST_SRCS))
 
-all: $(TARGET)
+# Per-target object lists
+REL_OBJS  := $(patsubst $(SRCDIR)/%.c,$(BUILD_REL)/%.o,$(SRCS))
+DBG_OBJS  := $(patsubst $(SRCDIR)/%.c,$(BUILD_DBG)/%.o,$(SRCS))
+ASAN_OBJS := $(patsubst $(SRCDIR)/%.c,$(BUILD_ASAN)/%.o,$(SRCS))
 
-$(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+TEST_LIB_OBJS := $(patsubst $(SRCDIR)/%.c,$(BUILD_TEST)/%.o,$(LIB_SRCS))
+TEST_T_OBJS   := $(patsubst $(TESTDIR)/%.c,$(BUILD_TEST)/%.o,$(TEST_SRCS))
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+ALL_DEPS := $(wildcard $(BUILDDIR)/*/*.d)
 
-$(OBJ_DIR):
-	mkdir -p $@
+# ── Per-target flags ─────────────────────────────────────────────────
+REL_CFLAGS  := $(COMMON_CFLAGS) -O2
+DBG_CFLAGS  := $(COMMON_CFLAGS) -g -O0 -Werror
+ASAN_CFLAGS := $(COMMON_CFLAGS) -g -O1 -Werror -fsanitize=address,undefined -fno-omit-frame-pointer
+TEST_CFLAGS := $(COMMON_CFLAGS) -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
 
-debug:
-	$(MAKE) MODE=debug
+ASAN_LDFLAGS := -fsanitize=address,undefined
+TEST_LDFLAGS := -fsanitize=address,undefined
 
-asan:
-	$(MAKE) MODE=asan
+# ── Phony targets ───────────────────────────────────────────────────
+.PHONY: all debug asan valgrind unit-test test clean
 
-valgrind: debug
-	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
-		./$(APP_NAME)-debug -i samples/demo.pcap -o out/
+# ── all (release) ────────────────────────────────────────────────────
+all: $(BINDIR)/pcapstat
 
-test: all
-	@if [ -x tests/run_tests.sh ]; then \
-		./tests/run_tests.sh; \
+# ── debug ────────────────────────────────────────────────────────────
+debug: $(BINDIR)/pcapstat-debug
+
+# ── asan ─────────────────────────────────────────────────────────────
+asan: $(BINDIR)/pcapstat-asan
+
+# ── valgrind (build debug, run under valgrind) ───────────────────────
+valgrind: $(BINDIR)/pcapstat-debug
+	valgrind --leak-check=full --show-leak-kinds=definite,indirect \
+	         --error-exitcode=1 $(BINDIR)/pcapstat-debug $(ARGS)
+
+# ── unit-test ────────────────────────────────────────────────────────
+unit-test: $(TEST_BINS)
+	@echo "=== Running unit tests ==="
+	@fail=0; \
+	for t in $(TEST_BINS); do \
+	    echo "--- $$t ---"; \
+	    $$t || fail=1; \
+	done; \
+	exit $$fail
+
+# ── test (integration: run_tests.sh) ────────────────────────────────
+test: all debug asan unit-test
+	@if [ -x $(TESTDIR)/run_tests.sh ]; then \
+	    echo "=== Running integration tests ==="; \
+	    $(TESTDIR)/run_tests.sh; \
 	else \
-		echo "Brak wykonywalnego skryptu tests/run_tests.sh"; \
-		exit 1; \
+	    echo "(no integration test script yet)"; \
 	fi
 
+# ── clean ────────────────────────────────────────────────────────────
 clean:
-	rm -rf $(BUILD_DIR) $(APP_NAME) $(APP_NAME)-debug $(APP_NAME)-asan
+	rm -rf $(BINDIR) $(BUILDDIR)
 
--include $(DEPS)
+# ── Link rules ───────────────────────────────────────────────────────
+$(BINDIR)/pcapstat: $(REL_OBJS) | $(BINDIR)
+	$(CC) -o $@ $^ $(LIBS)
+
+$(BINDIR)/pcapstat-debug: $(DBG_OBJS) | $(BINDIR)
+	$(CC) -o $@ $^ $(LIBS)
+
+$(BINDIR)/pcapstat-asan: $(ASAN_OBJS) | $(BINDIR)
+	$(CC) $(ASAN_LDFLAGS) -o $@ $^ $(LIBS)
+
+$(BINDIR)/test_%: $(BUILD_TEST)/test_%.o $(TEST_LIB_OBJS) | $(BINDIR)
+	$(CC) $(TEST_LDFLAGS) -o $@ $^ $(LIBS)
+
+# ── Compile rules ────────────────────────────────────────────────────
+$(BUILD_REL)/%.o: $(SRCDIR)/%.c | $(BUILD_REL)
+	$(CC) $(REL_CFLAGS) -I$(INCDIR) -c -o $@ $<
+
+$(BUILD_DBG)/%.o: $(SRCDIR)/%.c | $(BUILD_DBG)
+	$(CC) $(DBG_CFLAGS) -I$(INCDIR) -c -o $@ $<
+
+$(BUILD_ASAN)/%.o: $(SRCDIR)/%.c | $(BUILD_ASAN)
+	$(CC) $(ASAN_CFLAGS) -I$(INCDIR) -c -o $@ $<
+
+$(BUILD_TEST)/%.o: $(SRCDIR)/%.c | $(BUILD_TEST)
+	$(CC) $(TEST_CFLAGS) -I$(INCDIR) -c -o $@ $<
+
+$(BUILD_TEST)/%.o: $(TESTDIR)/%.c | $(BUILD_TEST)
+	$(CC) $(TEST_CFLAGS) -I$(INCDIR) -c -o $@ $<
+
+# ── Directory creation ───────────────────────────────────────────────
+$(BINDIR) $(BUILD_REL) $(BUILD_DBG) $(BUILD_ASAN) $(BUILD_TEST):
+	mkdir -p $@
+
+# ── Auto-dependencies ────────────────────────────────────────────────
+-include $(ALL_DEPS)
