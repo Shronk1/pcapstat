@@ -1,0 +1,367 @@
+# `pcapstat` Implementation Roadmap
+
+This document breaks down the `pcapstat` implementation into atomic, well-scoped tasks (`TASK-01` – `TASK-13`). Pass one task at a time to the AI agent together with the **Global Context & Rules** section.
+
+## Global Context & Rules (provide to the agent for every task)
+
+* **Project Goal:** Linux C CLI tool analyzing TCP and UDP traffic from one or more `.pcap` files, generating PNG charts and a multi-page PDF report with statistics, traffic characteristics, and detected anomalies.
+* **Output Language:** All CLI messages, PNG chart labels, and PDF report text must be in **English** (ASCII-safe for `libcairo`'s toy text API and standard for technical portfolios).
+* **Language Standard:** C11 (`-std=c11 -D_DEFAULT_SOURCE`).
+* **Allowed Dependencies:** Standard C/POSIX/Linux headers only (`<net/ethernet.h>`, `<netinet/ip.h>`, `<netinet/ip6.h>`, `<netinet/tcp.h>`, `<netinet/udp.h>`), `libpcap` (`-lpcap`), `libcairo` (`-lcairo`), and `libm` (`-lm`). Do not use Python or external commands via `system()` in production code.
+* **Code Quality & C Safety Requirements:**
+  * Zero compiler warnings under `-Wall -Wextra -Wpedantic -Wshadow` (enforced with `-Werror` in `debug` and `asan` targets).
+  * Zero memory leaks or invalid reads/writes (`AddressSanitizer`, `UndefinedBehaviorSanitizer`, `Valgrind`).
+  * **No unaligned memory access:** When decoding network headers from a `libpcap` buffer, NEVER cast raw pointers directly to structs (e.g., `(const struct iphdr *)(buf + 14)` triggers UB under UBSan). Always copy headers into local variables using `memcpy()`.
+  * Every binary `.pcap` parse must explicitly check remaining buffer length (`caplen`) to prevent buffer over-reads.
+  * Consistent error handling: functions return an error code (`0` = success, negative value from `enum pcapstat_err` = failure) and release all resources before returning (`goto cleanup` pattern).
+* **Two-Tier Documentation Rules:**
+  * **Tier 1 — Header Contracts in `include/*.h` (mandatory for every code task):** Every public function and key struct must have concise Doxygen comments (`/** ... */`) specifying purpose, return codes (`@return`), and **memory ownership** (who allocates, whether pointers are borrowed, and which function frees them). In `.c` files, comment only non-obvious low-level logic (e.g., `memcpy` alignment, modular `seq` arithmetic).
+  * **Tier 2 — Living `ARCHITECTURE.md` (milestone tasks only):** In tasks marked for architecture updates (`TASK-01`, `TASK-04`, `TASK-07`, `TASK-08`, `TASK-10`), add a concise section (5–15 lines) documenting design decisions, edge cases, and memory model. This serves as context for subsequent agent sessions and the source of truth for `README.md`.
+* **Target Directory Structure:**
+  ```text
+  pcapstat/
+  ├── Makefile
+  ├── ARCHITECTURE.md
+  ├── README.md
+  ├── .gitignore
+  ├── include/
+  │   ├── common.h
+  │   ├── cli.h
+  │   ├── parser.h
+  │   ├── hashtable.h
+  │   ├── stats.h
+  │   ├── anomaly.h
+  │   ├── charts.h
+  │   └── report.h
+  ├── src/
+  │   ├── main.c
+  │   ├── cli.c
+  │   ├── parser.c
+  │   ├── hashtable.c
+  │   ├── stats.c
+  │   ├── anomaly.c
+  │   ├── charts.c
+  │   └── report.c
+  ├── samples/
+  │   └── demo.pcap
+  └── tests/
+      ├── gen_demo_pcap.c
+      ├── test_cli.c
+      ├── test_parser.c
+      ├── test_hashtable.c
+      ├── test_stats.c
+      ├── test_anomaly.c
+      └── run_tests.sh
+  ```
+
+## Phase 0: Project Skeleton, Test Data, and CLI
+
+### TASK-01: Project Skeleton, `Makefile`, `ARCHITECTURE.md`, and Common Definitions
+* **Dependencies:** none
+* **Files:** `Makefile`, `.gitignore`, `ARCHITECTURE.md`, `include/common.h`, placeholder `src/main.c`
+* **Goal:** Set up the build environment (`all`, `debug`, `asan`, unit tests), shared types/error codes, and initial architecture document.
+* **Requirements:**
+  1. Create directories: `include/`, `src/`, `samples/`, `tests/`.
+  2. Configure `Makefile`:
+     * Common flags: `-std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Wpedantic -Wshadow -MMD -MP`.
+     * Use `pkg-config` for `libpcap` and `cairo`; link `-lm`.
+     * Add `-Werror` to `debug` and `asan` targets (omit `-Werror` in default `all`/release for portability across compiler versions).
+     * Targets: `all`, `debug`, `asan`, `unit-test` (builds and runs existing `tests/test_*.c` with ASan/UBSan without linking `src/main.c`), `valgrind`, `test`, `clean`.
+  3. Create `.gitignore` ignoring `build/`, `out/`, `pcapstat_out/`, `pcapstat*` binaries, compiled test binaries (`tests/test_*` without extension, `tests/gen_demo_pcap`), `*.o`, `*.d`, and generated `*.png`, `*.pdf` (excluding optional examples in `docs/`).
+  4. In `include/common.h` (with Doxygen comments), define:
+     * `PCAPSTAT_VERSION`.
+     * `enum pcapstat_err`: `PCAPSTAT_OK = 0`, `PCAPSTAT_ERR_ARGS = -1`, `PCAPSTAT_ERR_IO = -2`, `PCAPSTAT_ERR_PCAP = -3`, `PCAPSTAT_ERR_NOMEM = -4`, `PCAPSTAT_ERR_RENDER = -5`.
+     * `anomaly_thresholds_t` struct with default macros (`DEFAULT_PORTSCAN_THRESHOLD 20`, `DEFAULT_SYN_FLOOD_MIN 50`, `DEFAULT_SYN_RATIO 3.0`, `DEFAULT_RETRANS_PCT 5.0`, `DEFAULT_RST_PCT 10.0`, `DEFAULT_UDP_BURST_MULT 3.0`, `DEFAULT_UDP_BURST_MIN 100`) and a default initializer macro/function so `cli.h` and `anomaly.h` share one type.
+     * Safe constants (e.g., max path lengths).
+  5. Create initial `ARCHITECTURE.md` outlining the data pipeline (`PCAP -> Parser -> Stats -> Anomaly -> Charts/Report`), error code convention, memory ownership rules, and placeholder sections for upcoming milestones (`Parser`, `Stats Engine`, `Anomaly Detection`, `Rendering & PDF`).
+  6. Create minimal `src/main.c` returning `0` to verify the build.
+* **Acceptance Criteria:**
+  * `make && make debug && make asan` succeed with zero errors or warnings.
+  * `./pcapstat` runs and exits with code `0`.
+  * `ARCHITECTURE.md` and `include/common.h` comments match the implementation.
+
+### TASK-02: Synthetic Traffic Generator (`samples/demo.pcap`)
+* **Dependencies:** `TASK-01`
+* **Files:** `tests/gen_demo_pcap.c`, generated `samples/demo.pcap`, `Makefile` update (`samples/demo.pcap` or `gen-sample` target)
+* **Goal:** Create a deterministic, synthetic `.pcap` file early so parser, stats, and anomaly modules can be tested against real captures at every step.
+* **Requirements:**
+  1. Write a standalone C program `tests/gen_demo_pcap.c` using `libpcap` (`pcap_open_dead(DLT_EN10MB, 65535)`, `pcap_dump_open`, `pcap_dump`) to craft valid Ethernet + IPv4 (plus several IPv6 frames and one 802.1Q VLAN `0x8100` frame) TCP/UDP packets.
+  2. The generated `samples/demo.pcap` (a few dozen KB) must contain a known, deterministic packet count (documented as a summary table in the file header of `tests/gen_demo_pcap.c`), including:
+     * Normal TCP traffic (HTTPS:443, HTTP:80, SSH:22) with full `SYN -> SYN-ACK -> ACK` handshake, payload transfer, and `FIN`.
+     * Normal UDP traffic (DNS:53, NTP:123).
+     * Embedded anomalies:
+       * Port scan: `SYN` packets to 25 distinct destination ports from one source IP.
+       * TCP retransmissions: repeated `seq` with `payload_len > 0` in the same flow.
+       * At least 1 Xmas Scan (`FIN+PSH+URG`) and 1 Null Scan (no flags) packet.
+       * Short UDP burst (e.g., 120 packets in a single 1-second window vs. a few packets/s in other windows).
+       * 2 intentionally malformed/truncated packets (e.g., truncated IP header or invalid `ihl < 5`) to verify parser resilience.
+  3. Run the generator and save `samples/demo.pcap`.
+* **Acceptance Criteria:**
+  * `tests/gen_demo_pcap.c` compiles cleanly with `-Wall -Wextra -Wpedantic -Werror` and passes under ASan.
+  * `samples/demo.pcap` exists, is non-empty, and is valid per `file samples/demo.pcap` (and `tcpdump -nn -r samples/demo.pcap` if available).
+
+### TASK-03: CLI Argument Parser Module
+* **Dependencies:** `TASK-01`
+* **Files:** `include/cli.h`, `src/cli.c`, `tests/test_cli.c`
+* **Goal:** Parse CLI flags supporting one or multiple `.pcap` inputs, output directory, and anomaly thresholds.
+* **Requirements:**
+  1. Define `cli_config_t`:
+     * Input file paths (`char **input_files`, `size_t input_count`).
+     * Output directory (`char *output_dir`, default `"./pcapstat_out"`).
+     * `anomaly_thresholds_t thresholds` (from `common.h`, initialized to defaults).
+     * Flags: `bool verbose`, `bool show_help`, `bool show_version`.
+  2. Use `getopt_long()` to support:
+     * `-i, --input <file.pcap>` (repeatable, plus optional positional args at end of command),
+     * `-o, --output <dir>`,
+     * `--portscan-threshold <N>` (validated safely with `strtol`),
+     * `-v, --verbose`,
+     * `-h, --help`,
+     * `-V, --version`.
+  3. Implement (with Doxygen docs in `include/cli.h` covering ownership of allocated strings):
+     * `int cli_parse(int argc, char **argv, cli_config_t *cfg)`
+     * `int cli_validate_and_prepare(const cli_config_t *cfg)` — verifies input readability (`access(..., R_OK)`) and creates output directory (`mkdir(..., 0755)`, tolerating `EEXIST`).
+     * `void cli_print_usage(FILE *stream, const char *prog_name)`
+     * `void cli_free(cli_config_t *cfg)`
+  4. Write `tests/test_cli.c` covering multiple `-i` files, positional args, `--help`, `--version`, `--portscan-threshold` override, and invalid input rejection.
+* **Acceptance Criteria:**
+  * `make asan && make unit-test` pass with zero errors or memory leaks.
+  * Missing input files or invalid thresholds return `PCAPSTAT_ERR_ARGS` with a clear `stderr` message.
+  * All public functions and structs in `include/cli.h` have concise Doxygen comments.
+
+## Phase 1: `.pcap` Parser & Core Data Structures
+
+### TASK-04: Safe L2/L3/L4 Packet Parser (`libpcap`)
+* **Dependencies:** `TASK-01`, `TASK-02`
+* **Files:** `include/parser.h`, `src/parser.c`, `tests/test_parser.c`, `ARCHITECTURE.md` update
+* **Goal:** Read `.pcap` files via `libpcap` and decode TCP/UDP packets into a unified struct without buffer over-reads or unaligned memory access.
+* **Requirements:**
+  1. Define `parsed_packet_t`:
+     * `double timestamp` (seconds with microsecond precision from `hdr->ts`),
+     * `uint32_t wire_len`, `uint32_t cap_len`,
+     * `uint8_t ip_version` (`4` or `6`),
+     * `uint8_t src_ip[16]`, `uint8_t dst_ip[16]` (IPv4 in first 4 bytes with remaining zeroed; IPv6 in 16 bytes),
+     * `uint8_t proto` (`IPPROTO_TCP`, `IPPROTO_UDP`, or other),
+     * `uint16_t src_port`, `uint16_t dst_port` (host byte order via `ntohs`),
+     * TCP fields: `uint8_t tcp_flags`, `uint32_t tcp_seq`, `uint32_t tcp_ack`, `uint16_t tcp_window`, `uint32_t payload_len`,
+     * `bool is_malformed` for corrupted or truncated L3/L4 headers.
+  2. Define callback type: `typedef int (*packet_handler_fn)(const parsed_packet_t *pkt, void *user_data);`.
+  3. Implement `int parser_process_file(const char *filepath, packet_handler_fn cb, void *user_data)`:
+     * Opens capture via `pcap_open_offline()`.
+     * Supports link types (`pcap_datalink`): `DLT_EN10MB` (including optional 802.1Q VLAN `0x8100` and QinQ `0x88a8` tags), `DLT_LINUX_SLL` (16 B), `DLT_LINUX_SLL2` (20 B), and `DLT_RAW`.
+     * **Reads all headers via `memcpy()`** into local variables (zero raw pointer casts).
+     * Verifies `offset + needed <= hdr->caplen` before every read.
+     * Decodes IPv4 (validating `ihl >= 5` and `tot_len >= ihl * 4`) and base IPv6 (40-byte header).
+     * Decodes TCP (validating `doff >= 5` and computing `payload_len` without underflow) and UDP (validating length `>= 8`).
+     * Sets `is_malformed = true` on invalid/truncated packets and still invokes the callback so stats can count them.
+  4. Add helper `void parser_format_ip(uint8_t ip_version, const uint8_t ip[16], char *buf, size_t buf_len)` using `inet_ntop`.
+  5. Write `tests/test_parser.c` parsing `samples/demo.pcap` and asserting exact TCP, UDP, VLAN, IPv6, and `is_malformed` counts.
+  6. **Documentation:** Document public API in `include/parser.h` (Doxygen, including lifetime of `const parsed_packet_t *pkt` in callbacks) and update the `Parser` section in `ARCHITECTURE.md` (supported DLTs, `memcpy` alignment safety, `caplen` checks, malformed packet handling).
+* **Acceptance Criteria:**
+  * `make asan && make unit-test` pass 100% with zero ASan/UBSan errors (specifically no `misaligned address` warnings).
+  * Malformed packets in `samples/demo.pcap` are flagged `is_malformed` without crashing.
+  * `include/parser.h` and `ARCHITECTURE.md` (`Parser` section) are updated.
+
+### TASK-05: Generic $O(1)$ Hash Table
+* **Dependencies:** `TASK-01`
+* **Files:** `include/hashtable.h`, `src/hashtable.c`, `tests/test_hashtable.c`
+* **Goal:** Provide a lightweight hash table with dynamic rehashing for tracking IPs, ports, time-series buckets, and flows.
+* **Requirements:**
+  1. Implement chaining or open-addressing hash table using 64-bit FNV-1a hashing.
+  2. Support arbitrary binary keys (`const void *key, size_t key_len`, copied internally) and `void *value` payloads.
+  3. Automatically rehash when load factor exceeds `0.7`.
+  4. Public API (fully documented with Doxygen in `include/hashtable.h`, explicitly stating key/value ownership and iterator validity):
+     * `ht_t *ht_create(size_t initial_capacity)`
+     * `void *ht_get(const ht_t *ht, const void *key, size_t key_len)`
+     * `int ht_put(ht_t *ht, const void *key, size_t key_len, void *value)` (returns `PCAPSTAT_OK` or `PCAPSTAT_ERR_NOMEM`; overwrites existing value)
+     * `size_t ht_count(const ht_t *ht)`
+     * Iterator: `ht_iter_t ht_iter_begin(const ht_t *ht)` and `bool ht_iter_next(ht_iter_t *it, const void **key_out, size_t *key_len_out, void **val_out)`
+     * `void ht_destroy(ht_t *ht, void (*free_val_fn)(void *))`
+  5. Write `tests/test_hashtable.c` inserting 50,000 keys (triggering multiple rehashes), testing updates, iteration, and full cleanup.
+* **Acceptance Criteria:**
+  * `make asan && make unit-test` pass cleanly.
+  * Valgrind on `tests/test_hashtable` reports `0 bytes in 0 blocks` leaked.
+  * `include/hashtable.h` clearly documents memory ownership for `key`, `value`, and `free_val_fn`.
+
+## Phase 2: Statistics Aggregation & Flow Tracking
+
+### TASK-06: Stats Engine — Part 1: Global Metrics, Histogram, TCP Flags, and Time Series
+* **Dependencies:** `TASK-04`, `TASK-05`
+* **Files:** `include/stats.h`, `src/stats.c`
+* **Goal:** Build the streaming stats core (no raw packets stored in RAM) with memory-safe sparse time-series handling across multiple `.pcap` files.
+* **Requirements:**
+  1. Define `stats_ctx_t` in `include/stats.h` (structured to accommodate host/port/flow tables in `TASK-07`) covering:
+     * **Global metrics:** `files_processed`, `total_packets`, `total_bytes`, `tcp_packets`, `tcp_bytes`, `udp_packets`, `udp_bytes`, `other_packets`, `malformed_packets`, `first_ts`, `last_ts`, `duration_sec`, `avg_pps`, `avg_bps`.
+     * **Packet size histogram:** 7 fixed bins (`0-64`, `65-128`, `129-256`, `257-512`, `513-1024`, `1025-1500`, `>1500` bytes).
+     * **TCP flag counters:** `syn`, `syn_ack`, `ack`, `fin`, `rst`, `psh`, `urg`, `ece_cwr`, plus suspicious combinations (`null_scan_pkts`, `xmas_scan_pkts`, `syn_fin_pkts`, `syn_rst_pkts`).
+     * **Sparse Time Series:**
+       * During ingestion, store 1-second buckets in `ht_t *ts_buckets_ht` keyed by `int64_t sec = (int64_t)floor(pkt->timestamp)`. **Never allocate a dense `(last_ts - first_ts)` array**, preventing RAM exhaustion if input files span days.
+       * In `stats_finalize()`, export buckets into a sorted `ts_bucket_t *timeline` array; if count exceeds `120`, downsample evenly to 60–120 chart points (while preserving raw 1-second UDP bucket data or mean/max stats for burst detection).
+  2. Implement `stats_init`, `stats_update(stats_ctx_t *ctx, const parsed_packet_t *pkt)`, callback wrapper `stats_packet_cb(const parsed_packet_t *pkt, void *user_data)`, `stats_finalize`, and `stats_free` with Doxygen comments in `include/stats.h`.
+  3. Guard `stats_finalize` against division by zero (`duration_sec == 0.0` for 0–1 packets) and unsorted timestamps (`first_ts = min`, `last_ts = max`).
+* **Acceptance Criteria:**
+  * `make asan` compiles cleanly without warnings.
+  * Zero memory leaks across `stats_init -> stats_update -> stats_finalize -> stats_free`.
+  * Public API in `include/stats.h` is documented with Doxygen.
+
+### TASK-07: Stats Engine — Part 2: Hosts, Ports/Services, Flows, and Top-N Rankings
+* **Dependencies:** `TASK-06`
+* **Files:** `include/stats.h`, `src/stats.c`, `tests/test_stats.c`, `ARCHITECTURE.md` update
+* **Goal:** Extend `stats_ctx_t` with per-host, per-port, and 5-tuple flow tracking, TCP retransmission detection, and Top-N export functions.
+* **Requirements:**
+  1. **Host stats (IP):** In `ht_t *hosts_ht` (key: `{ip_version, ip[16]}`), store `host_stats_t`:
+     * `tx_packets`, `tx_bytes`, `rx_packets`, `rx_bytes`,
+     * `syn_sent`, `syn_ack_recv`, `rst_sent`, `rst_recv`,
+     * Unique destination port tracking (for Port Scan detection) using a **fixed bitmap `uint8_t dst_ports_bitmap[8192]`** (65,536 bits = 8 KB per host, $O(1)$ bit-set, zero nested `malloc`s) and `uint32_t unique_dst_ports`.
+  2. **Port & service stats:** In `ht_t *ports_ht` (key: `{proto, dst_port}`), count packets and bytes. Add `const char *stats_port_service_name(uint8_t proto, uint16_t port)` mapping common ports (`22 -> SSH`, `25 -> SMTP`, `53 -> DNS`, `80 -> HTTP`, `123 -> NTP`, `443 -> HTTPS`, `3306 -> MySQL`, `5432 -> PostgreSQL`, `8080 -> HTTP-Alt`, etc.).
+  3. **Flow tracking:** In `ht_t *flows_ht` (5-tuple key: `{ip_version, src_ip, dst_ip, src_port, dst_port, proto}`), store `flow_stats_t`:
+     * `first_ts`, `last_ts`, `packets`, `bytes`, `tcp_flags_seen`,
+     * `bool has_seq`, `uint32_t max_seq`, `double last_seq_ts`, `uint64_t retransmissions`:
+       * Detect candidate TCP retransmissions when `payload_len > 0` using wrap-safe modular arithmetic: `if (flow->has_seq && pkt->timestamp >= flow->last_seq_ts && (int32_t)(pkt->tcp_seq - flow->max_seq) <= 0)` increment `retransmissions`; otherwise update `max_seq` and `last_seq_ts`.
+  4. **Top-N exports (via `qsort`):**
+     * `size_t stats_top_hosts(const stats_ctx_t *ctx, const host_stats_t **out, size_t max_n)`
+     * `size_t stats_top_ports(const stats_ctx_t *ctx, const port_stats_t **out, size_t max_n)`
+     * `size_t stats_top_flows(const stats_ctx_t *ctx, const flow_stats_t **out, size_t max_n)`
+  5. Write `tests/test_stats.c` feeding `samples/demo.pcap` plus a synthetic unsorted-timestamp test spanning 48 hours (verifying no RAM spike and no divide-by-zero).
+  6. **Documentation:** Update Doxygen in `include/stats.h` (explicitly noting `stats_top_*` returns borrowed pointers valid until `stats_free`) and populate the `Stats Engine` section in `ARCHITECTURE.md` (streaming memory model, sparse time series, 8 KB port bitmaps, TCP retransmission logic, complexity).
+* **Acceptance Criteria:**
+  * `make asan && make unit-test` pass 100%.
+  * Test on `samples/demo.pcap` detects 25 unique ports for the scanning host, non-zero TCP retransmissions, and accurate Top-N rankings.
+  * Zero leaks under Valgrind.
+  * `include/stats.h` and `ARCHITECTURE.md` (`Stats Engine` section) are updated.
+
+## Phase 3: Network Anomaly Detection
+
+### TASK-08: Network Anomaly Detection Rules
+* **Dependencies:** `TASK-07`, `TASK-02`
+* **Files:** `include/anomaly.h`, `src/anomaly.c`, `tests/test_anomaly.c`, `ARCHITECTURE.md` update
+* **Goal:** Evaluate aggregated stats against deterministic heuristics and output severity-sorted anomalies.
+* **Requirements:**
+  1. Define types:
+     * `enum anomaly_severity { ANOMALY_INFO, ANOMALY_WARNING, ANOMALY_CRITICAL };`
+     * `typedef struct { anomaly_severity_t severity; char category[64]; char subject[128]; char description[256]; } anomaly_t;`
+     * `anomaly_list_t` (dynamic array with `anomaly_list_init`, `anomaly_list_free`).
+  2. Implement `int anomaly_detect(const stats_ctx_t *stats, const anomaly_thresholds_t *thresholds, anomaly_list_t *out)` with rules:
+     * **Port Scan:** Host targeted $\ge N$ unique destination ports via `SYN`/UDP (default $N \ge 20$).
+     * **SYN Flood / Incomplete Handshakes:** High `SYN` count ($\ge 50$) with `SYN` to `SYN-ACK` ratio $> 3.0$.
+     * **Elevated TCP Retransmissions:** Retransmission rate $> 5\%$ per flow (min. 20 TCP packets) or globally.
+     * **RST Spike:** `RST` packets exceed $> 10\%$ of TCP traffic (min. 30 TCP packets).
+     * **Suspicious TCP Flags:** Any Null Scan (no flags), Xmas Scan (`FIN+PSH+URG`), or `SYN+FIN` / `SYN+RST` packet.
+     * **UDP Burst / Flood:** Any 1-second window where UDP packet count exceeds $3\times$ the mean and an absolute minimum ($\ge 100$ pkt/s).
+     * **Malformed / Truncated Packets:** Flag (`WARNING` or `INFO`) if `malformed_packets > 0`.
+  3. Sort results by severity (`ANOMALY_CRITICAL` -> `ANOMALY_WARNING` -> `ANOMALY_INFO`).
+  4. Write `tests/test_anomaly.c` verifying:
+     * Detection of all anomalies embedded in `samples/demo.pcap` (Port Scan, Xmas/Null Scan, Retransmissions, UDP Burst, Malformed).
+     * Clean traffic returns 0 warnings/criticals.
+  5. **Documentation:** Document public API in `include/anomaly.h` (Doxygen) and populate the `Anomaly Detection` section in `ARCHITECTURE.md` (concise table of all 7 heuristics, exact conditions, default thresholds, and severities).
+* **Acceptance Criteria:**
+  * `make asan && make unit-test` pass 100% with zero memory errors.
+  * `include/anomaly.h` and `ARCHITECTURE.md` (`Anomaly Detection` section) are updated.
+
+## Phase 4: PNG Visualization & PDF Report Generation
+
+### TASK-09: PNG Chart Generator (`libcairo`)
+* **Dependencies:** `TASK-07`
+* **Files:** `include/charts.h`, `src/charts.c`
+* **Goal:** Render clean vector charts via `libcairo` to PNG files with reusable drawing functions for direct PDF embedding.
+* **Requirements:**
+  1. Design each of the 4 chart functions to take `(cairo_t *cr, const stats_ctx_t *stats, double x, double y, double width, double height)` and isolate graphics state via `cairo_save(cr)` / `cairo_restore(cr)`.
+  2. Implement 4 charts plus wrapper `int charts_generate_all(const stats_ctx_t *stats, const char *output_dir)`:
+     * `traffic_timeline.png` — line chart of packets over time split into TCP (blue) and UDP (orange) with legend.
+     * `protocol_ports.png` — horizontal bar chart of Top 10 destination ports with service labels (e.g., `443 (HTTPS)`) and counts.
+     * `packet_sizes.png` — bar histogram of the 7 packet size bins.
+     * `tcp_flags.png` — bar chart of TCP flags (`SYN`, `SYN-ACK`, `ACK`, `FIN`, `RST`, `PSH`, `URG`).
+  3. Use a consistent color palette, white background, subtle gridlines, compact axis formatting (`1.2K`, `3.5M`), `"Sans"` font, English titles/labels, and graceful empty-state handling (e.g., *"No TCP packets in capture"* instead of divide-by-zero).
+  4. Free `cairo_destroy()` and `cairo_surface_destroy()` on all error paths.
+  5. Add Doxygen comments in `include/charts.h` detailing the `(x, y, width, height)` bounding box and `cairo_t *` state preservation guarantee.
+* **Acceptance Criteria:**
+  * `make asan` compiles cleanly without warnings.
+  * All 4 PNG files are generated in `output_dir`, non-empty, and valid PNGs (`file out/*.png`).
+  * `include/charts.h` has complete Doxygen documentation.
+  * **Manual check:** Visually inspect generated PNGs to ensure axis labels do not overlap.
+
+### TASK-10: Multi-Page PDF Report Generator (`libcairo`)
+* **Dependencies:** `TASK-07`, `TASK-08`, `TASK-09`
+* **Files:** `include/report.h`, `src/report.c`, `ARCHITECTURE.md` update
+* **Goal:** Generate a polished multi-page A4 (`595 x 842 pt`) `report.pdf` using `cairo_pdf_surface_create()`.
+* **Requirements:**
+  1. Implement `int report_generate(const cli_config_t *cfg, const stats_ctx_t *stats, const anomaly_list_t *anomalies, const char *pdf_path)`.
+  2. Implement a helper for word-wrapping long strings using `cairo_text_extents()` so anomaly descriptions and file paths never overflow page margins.
+  3. Maintain consistent page layout: margins, header, and footer with generation timestamp and page number (`Page X` or `Page X / Y` if pre-calculated).
+  4. Page structure (English):
+     * **Page 1 (Executive Summary):** Title, input `.pcap` file list, KPI cards/table (Total Packets, Total Volume, Capture Duration, Avg Bitrate, TCP vs UDP share %, Active Flows, Detected Anomalies summary).
+     * **Page 2 (Traffic Characteristics):** Striped tables for Top 10 IP Addresses (TX/RX packets, total bytes), Top 10 Destination Ports & Services, and Top 10 Flows (5-tuple, packets, bytes, duration).
+     * **Page 3 (Visualizations):** All 4 charts embedded vectorially in a $2 \times 2$ grid via `charts.h`.
+     * **Page 4+ (Detected Anomalies):** Color-coded severity badges (`CRITICAL` red, `WARNING` orange, `INFO` blue), category, subject, and wrapped description with automatic pagination (`cairo_show_page()`). If empty, display *"No network anomalies detected."*.
+  5. **Documentation:** Document contract in `include/report.h` (Doxygen) and update the `Rendering & PDF` section in `ARCHITECTURE.md` (shared `cairo_t *` architecture, word-wrapping, pagination).
+* **Acceptance Criteria:**
+  * `make asan` compiles cleanly without warnings.
+  * `out/report.pdf` is a valid multi-page PDF (`file out/report.pdf`, optionally `pdfinfo out/report.pdf`).
+  * `include/report.h` and `ARCHITECTURE.md` (`Rendering & PDF` section) are updated.
+  * **Manual check:** Open `report.pdf` in a PDF viewer to verify margins, text wrapping, and the $2 \times 2$ chart grid.
+
+### TASK-11: Main Pipeline Integration (`src/main.c`)
+* **Dependencies:** `TASK-03`, `TASK-04`, `TASK-07`, `TASK-08`, `TASK-09`, `TASK-10`
+* **Files:** `src/main.c`
+* **Goal:** Wire all modules into a clean, predictable execution pipeline with deterministic cleanup.
+* **Requirements:**
+  1. Execution flow in `main()`:
+     * `cli_parse()` -> handle `--help` / `--version` (exit `0`).
+     * `cli_validate_and_prepare()`.
+     * `stats_init()`.
+     * Loop over input `.pcap` files -> `parser_process_file(..., stats_packet_cb, &stats)`.
+     * `stats_finalize()`.
+     * `anomaly_detect()`.
+     * `charts_generate_all()`.
+     * `report_generate()`.
+     * Print concise summary to `stdout` (elapsed time, packet count, anomalies found, output file paths).
+     * Release all resources in a single `cleanup:` block on both success and failure paths.
+* **Acceptance Criteria:**
+  * `./pcapstat -i samples/demo.pcap -o out/` generates 4 PNGs + `report.pdf` and exits `0`.
+  * `./pcapstat-asan -i samples/demo.pcap -o out/` reports zero ASan/UBSan errors.
+  * `make valgrind` reports `0 errors` (if `libcairo`/`fontconfig` retain known `still reachable` caches, document this or verify with `--leak-check=full --show-leak-kinds=definite,indirect` showing zero leaks in project code).
+
+## Phase 5: Integration Tests & Portfolio Documentation
+
+### TASK-12: Automated Integration Test Suite (`tests/run_tests.sh`)
+* **Dependencies:** `TASK-02`, `TASK-11`
+* **Files:** `tests/run_tests.sh`, `Makefile` (`test` target update)
+* **Goal:** Provide a repeatable end-to-end test suite runnable via a single `make test` command.
+* **Requirements:**
+  1. Write `tests/run_tests.sh` (`set -euo pipefail`, `chmod +x`) that:
+     * Runs all unit tests (`make unit-test`).
+     * Tests invalid CLI invocations (no args, nonexistent file, invalid `--portscan-threshold` -> expect non-zero exit).
+     * Tests `--help` and `--version` (expect exit `0`).
+     * Runs `./pcapstat -i samples/demo.pcap -o <tmp_dir>` and verifies existence, non-zero size, and `file` headers for `report.pdf` and all 4 `.png` files.
+     * Runs `./pcapstat-asan` with multiple inputs (`-i samples/demo.pcap -i samples/demo.pcap`).
+     * Cleans up the temp directory via `trap`.
+  2. Wire the script into `make test` in `Makefile`.
+* **Acceptance Criteria:**
+  * `make test` passes completely with exit code `0`.
+
+### TASK-13: Portfolio-Ready `README.md`
+* **Dependencies:** `TASK-12`
+* **Files:** `README.md`
+* **Goal:** Produce clear documentation enabling reviewers/recruiters to understand the architecture, build, and verify the tool quickly.
+* **Requirements:**
+  1. Base all technical facts strictly on `ARCHITECTURE.md` and `include/*.h` contracts, covering:
+     * Tool purpose and key features.
+     * Modular architecture (ASCII pipeline `PCAP -> Parser -> Stats -> Anomaly -> Cairo PNG/PDF`, link to `ARCHITECTURE.md`, and rationale for key engineering choices).
+     * Dependencies and install commands for Ubuntu/Debian and Fedora/Arch.
+     * Build and test instructions (`make`, `make debug`, `make asan`, `make unit-test`, `make test`, `make valgrind`).
+     * CLI usage examples and complete flag reference table.
+     * Implemented anomaly heuristics with default thresholds.
+     * Known limitations and future work (e.g., `pcapng`, L7 inspection, multi-threaded processing).
+  2. (Optional) Copy 1–2 sample PNG charts generated from `samples/demo.pcap` into `docs/` and embed them in `README.md`.
+* **Acceptance Criteria:**
+  * Every command in `README.md` works cleanly in a fresh terminal.
+  * Flags, thresholds, and architectural claims match `ARCHITECTURE.md` and the codebase 100%.
+
+## Antigravity CLI Workflow Tips
+
+1. **One task = one clean session:** Always pass *Global Context & Rules*, exactly one task (e.g., `TASK-04`), plus `ARCHITECTURE.md` and the relevant `include/*.h` files.
+2. **Enforce self-verification:** Append to every prompt: *"After implementing changes, run all Acceptance Criteria commands (`make asan`, `make unit-test`), verify `.h` Doxygen (and `ARCHITECTURE.md` if applicable) is updated, and fix all warnings or errors before finishing."*
+3. **Parallelizable tasks:**
+   * After `TASK-01`: `TASK-02`, `TASK-03`, and `TASK-05` can run in parallel (no file overlap).
+   * After `TASK-07`: `TASK-08` and `TASK-09` can run in parallel.
+4. **Atomic Git commits:** Commit after each passing `TASK-XX` for safe rollbacks and clean Git history.
+5. **Visual review after `TASK-09` and `TASK-10`:** Inspect the generated PNGs and `report.pdf` locally and request a quick margin/font pass if anything overlaps.
