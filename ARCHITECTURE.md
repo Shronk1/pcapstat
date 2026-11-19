@@ -46,7 +46,22 @@ Resources are released before returning via a `goto cleanup` pattern.
 
 ## Parser
 
-*Placeholder — to be completed in TASK-04.*
+`parser_process_file()` opens a `.pcap` via `pcap_open_offline()` and decodes
+each packet into a stack-local `parsed_packet_t`, invoking a user callback.
+
+- **Supported DLTs:** `DLT_EN10MB` (Ethernet II, with 802.1Q `0x8100` and
+  QinQ `0x88A8` VLAN tag peeling), `DLT_LINUX_SLL` (16 B), `DLT_LINUX_SLL2`
+  (20 B), and `DLT_RAW` (version nibble detection).
+- **Alignment safety:** All L2/L3/L4 headers are read via `memcpy()` into
+  stack-local `struct iphdr`, `struct ip6_hdr`, `struct tcphdr`, `struct udphdr`.
+  No raw pointer casts — eliminates UBSan misaligned-address errors.
+- **Bounds checking:** Every `memcpy` is preceded by `offset + needed <= caplen`.
+  On failure the packet is marked `is_malformed = true`.
+- **Malformed packets:** Delivered to the callback with `is_malformed` set so
+  downstream modules can count them. Covers truncated captures, `ihl < 5`,
+  `tot_len < ihl*4`, `doff < 5`, and `udp_len < 8`.
+- **Callback lifetime:** `const parsed_packet_t *pkt` is a borrowed pointer
+  valid only during the callback invocation.
 
 ## Stats Engine
 
