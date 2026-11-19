@@ -92,20 +92,10 @@ typedef struct {
  * ------------------------------------------------------------------- */
 
 /** @brief Return the minimum of two values (evaluated once each). */
-#define PCAPSTAT_MIN(a, b) \
-    ({                     \
-        __typeof__(a) _a = (a); \
-        __typeof__(b) _b = (b); \
-        _a < _b ? _a : _b;     \
-    })
+#define PCAPSTAT_MIN(a, b) ((a) < (b) ? (a) : (b))
 
 /** @brief Return the maximum of two values (evaluated once each). */
-#define PCAPSTAT_MAX(a, b) \
-    ({                     \
-        __typeof__(a) _a = (a); \
-        __typeof__(b) _b = (b); \
-        _a > _b ? _a : _b;     \
-    })
+#define PCAPSTAT_MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /** @brief Number of elements in a statically-sized array. */
 #define PCAPSTAT_ARRAY_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))

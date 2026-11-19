@@ -57,7 +57,7 @@ ASAN_LDFLAGS := -fsanitize=address,undefined
 TEST_LDFLAGS := -fsanitize=address,undefined
 
 # ── Phony targets ───────────────────────────────────────────────────
-.PHONY: all debug asan valgrind unit-test test clean
+.PHONY: all debug asan valgrind unit-test test clean gen-sample
 
 # ── all (release) ────────────────────────────────────────────────────
 all: $(BINDIR)/pcapstat
@@ -91,6 +91,22 @@ test: all debug asan unit-test
 	else \
 	    echo "(no integration test script yet)"; \
 	fi
+
+# ── gen-sample (synthetic demo.pcap) ─────────────────────────────────
+GEN_SRC := $(TESTDIR)/gen_demo_pcap.c
+GEN_BIN := $(BINDIR)/gen_demo_pcap
+SAMPLE  := samples/demo.pcap
+
+gen-sample: $(SAMPLE)
+
+$(SAMPLE): $(GEN_BIN) | samples
+	./$(GEN_BIN)
+
+$(GEN_BIN): $(GEN_SRC) | $(BINDIR)
+	$(CC) $(ASAN_CFLAGS) -I$(INCDIR) $(ASAN_LDFLAGS) -o $@ $< $(PCAP_LIBS)
+
+samples:
+	mkdir -p samples
 
 # ── clean ────────────────────────────────────────────────────────────
 clean:
