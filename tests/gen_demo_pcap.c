@@ -446,7 +446,7 @@ int main(void)
     /* ── 6. TCP Retransmissions (in HTTPS flow from IP_SRC) ────── */
     /* Repeated seq with payload > 0 simulates retransmission. */
     {
-        uint32_t retrans_seq = 500;  /* seq already "seen" in that flow */
+        uint32_t retrans_seq = 301;  /* seq already "seen" in that flow */
         emit_tcp4(IP_SRC, IP_DST, 50000, 443,
                   retrans_seq, 5001, TH_ACK_FLAG, 100);
         advance_ms(10);

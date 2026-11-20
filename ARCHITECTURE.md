@@ -143,7 +143,24 @@ each packet into a stack-local `parsed_packet_t`, invoking a user callback.
 
 ## Anomaly Detection
 
-*Placeholder — to be completed in TASK-08.*
+`anomaly_detect()` evaluates aggregated statistics in `stats_ctx_t` against
+run-time thresholds (`anomaly_thresholds_t` initialized to defaults from
+`common.h` or overridden by CLI flags). Findings are appended to caller-owned
+`anomaly_list_t` (dynamic array freed by `anomaly_list_free()`) and sorted
+descending by severity (`CRITICAL` -> `WARNING` -> `INFO`) with deterministic
+tie-breaking by category, subject, and description.
+
+### Heuristics Table
+
+| Heuristic | Exact Condition / Formula | Default Threshold | Severity |
+| :--- | :--- | :--- | :--- |
+| **Port Scan** | Host `unique_dst_ports >= portscan_threshold` (via SYN/UDP) | `20` ports | `CRITICAL` |
+| **SYN Flood** | Host or Global `SYN >= syn_flood_min` and `SYN / SYN_ACK > syn_ratio` | `>= 50` pkts, `> 3.0` ratio | `CRITICAL` |
+| **TCP Retransmissions** | Flow `retrans / pkts > retrans_pct` (min 20 pkts) or Global `total_retrans / tcp_pkts > retrans_pct` (min 20 pkts) | `> 5.0%` | `WARNING` |
+| **RST Spike** | Global `rst / tcp_pkts > rst_pct` (min 30 TCP pkts) | `> 10.0%` | `WARNING` |
+| **Suspicious TCP Flags** | Any Null (`0`), Xmas (`FIN+PSH+URG`), `SYN+FIN`, or `SYN+RST` segment | `> 0` pkts | `CRITICAL` |
+| **UDP Burst / Flood** | 1-second window `udp_pkts >= udp_burst_min` and `udp_pkts > udp_burst_mult * mean_udp` | `>= 100` pkt/s, `> 3.0x` mean | `WARNING` |
+| **Malformed Packets** | `malformed_packets > 0` (truncated headers, illegal IHL/length) | `> 0` pkts | `WARNING` |
 
 ## Rendering & PDF
 
