@@ -184,15 +184,20 @@ static void test_null_args(void)
     stats_free(&ctx);
 }
 
+/* FIX-03 (M1): half-open bins matching the chart labels
+ * "<64, 64-127, 128-255, 256-511, 512-1023, 1024-1513, >=1514".
+ * The old "<=64 ... <=1500" bins put 64 in "<64" and 1500..1513 nowhere
+ * near their label. */
 static void test_histogram_boundaries(void)
 {
     static const struct {
         uint32_t size;
         int bin;
     } cases[] = {
-        {0, 0},    {64, 0},   {65, 1},   {128, 1},  {129, 2},
-        {256, 2},  {257, 3},  {512, 3},  {513, 4},  {1024, 4},
-        {1025, 5}, {1500, 5}, {1501, 6}, {65535, 6},
+        {0, 0},     {63, 0},    {64, 1},    {127, 1},  {128, 2},
+        {255, 2},   {256, 3},   {511, 3},   {512, 4},  {1023, 4},
+        {1024, 5},  {1500, 5},  {1513, 5},  {1514, 6}, {1518, 6},
+        {65535, 6},
     };
     uint64_t expect[STATS_PACKET_SIZE_BINS] = {0};
     stats_ctx_t ctx;
@@ -556,15 +561,16 @@ static void test_unsorted_48h_and_retransmission(void)
     stats_ctx_t ctx;
     CHECK(stats_init(&ctx) == PCAPSTAT_OK);
 
+    /* tcp_data() segments carry 10 payload bytes. */
     struct {
         double ts;
         uint32_t seq;
     } in[] = {
-        {1.0, 100},      /* new: max=100, last_seq_ts=1.0            */
-        {172800.0, 100}, /* same seq, later ts          -> retrans 1 */
-        {90000.0, 99},   /* older seq, later than 1.0   -> retrans 2 */
-        {172800.0, 200}, /* ahead: max=200, last_seq_ts=172800       */
-        {100.0, 150},    /* ts < last_seq_ts: NOT retrans, rebase    */
+        {1.0, 100},      /* first: next_seq=110, last_seq_ts=1.0      */
+        {172800.0, 100}, /* same seq, later ts           -> retrans 1 */
+        {90000.0, 99},   /* older seq, later than 1.0    -> retrans 2 */
+        {172800.0, 200}, /* ahead: hole [110,200), next_seq=210       */
+        {100.0, 150},    /* ts < last_seq_ts: NOT counted, rebase     */
     };
     for (size_t i = 0; i < sizeof(in) / sizeof(in[0]); ++i) {
         parsed_packet_t p = tcp_data(in[i].ts, in[i].seq);
@@ -574,8 +580,12 @@ static void test_unsorted_48h_and_retransmission(void)
     const flow_stats_t *f = only_flow(&ctx);
     CHECK(f->packets == 5);
     CHECK(f->retransmissions == 2);
+    CHECK(f->out_of_order == 0);
     CHECK(f->first_ts == 1.0 && f->last_ts == 172800.0);
-    CHECK(f->max_seq == 150); /* documented: base follows the rebase */
+    CHECK(f->next_seq == 160);      /* documented: base follows the rebase */
+    CHECK(f->last_seq_ts == 100.0);
+    CHECK(!f->has_hole);            /* a rebase forgets the hole */
+    CHECK(ctx.tcp_retransmissions == 2);
 
     CHECK(stats_finalize(&ctx) == PCAPSTAT_OK);
     CHECK(ctx.timeline_count == 4); /* secs 1, 100, 90000, 172800 only */
@@ -621,7 +631,8 @@ static void test_service_names(void)
     CHECK(strcmp(stats_port_service_name(IPPROTO_TCP, 443), "HTTPS") == 0);
     CHECK(strcmp(stats_port_service_name(IPPROTO_TCP, 3306), "MySQL") == 0);
     CHECK(strcmp(stats_port_service_name(IPPROTO_TCP, 8080), "HTTP-Alt") == 0);
-    CHECK(strcmp(stats_port_service_name(IPPROTO_UDP, 9999), "UDP-Data") == 0);
+    /* FIX-03: no made-up demo-only "UDP-Data" service on 9999. */
+    CHECK(strcmp(stats_port_service_name(IPPROTO_UDP, 9999), "Unknown") == 0);
     CHECK(strcmp(stats_port_service_name(IPPROTO_TCP, 9999), "Unknown") == 0);
     CHECK(strcmp(stats_port_service_name(IPPROTO_TCP, 0), "Unknown") == 0);
     CHECK(strcmp(stats_port_service_name(IPPROTO_TCP, 1), "Unknown") == 0);
@@ -648,8 +659,10 @@ static void test_demo_hosts_ports_flows(void)
     const host_stats_t *scan = find_host(&ctx, 100); /* 10.0.0.100 */
     CHECK(scan != NULL);
     CHECK(scan->unique_dst_ports == 25);
+    CHECK(scan->dst_ports_bitmap != NULL); /* 25 > inline capacity */
 
     uint64_t retransmissions = 0;
+    uint64_t out_of_order = 0;
     uint64_t max_pkts = 0;
     ht_iter_t it = ht_iter_begin(ctx.flows_ht);
     const void *key;
@@ -658,10 +671,28 @@ static void test_demo_hosts_ports_flows(void)
     while (ht_iter_next(&it, &key, &key_len, &value)) {
         const flow_stats_t *flow = (const flow_stats_t *)value;
         retransmissions += flow->retransmissions;
+        out_of_order += flow->out_of_order;
         if (flow->packets > max_pkts)
             max_pkts = flow->packets;
     }
-    CHECK(retransmissions > 0);
+    /* The same 100-byte segment (seq 301, already delivered) sent three
+     * times 10 ms apart: exactly 3 retransmissions, no reordering. */
+    CHECK(retransmissions == 3);
+    CHECK(out_of_order == 0);
+    CHECK(ctx.tcp_retransmissions == retransmissions);
+    CHECK(ctx.tcp_out_of_order == out_of_order);
+
+    /* Only hosts that probed > 16 ports own a bitmap (just the scanner). */
+    size_t with_bitmap = 0;
+    it = ht_iter_begin(ctx.hosts_ht);
+    while (ht_iter_next(&it, &key, &key_len, &value)) {
+        const host_stats_t *h = (const host_stats_t *)value;
+        if (h->dst_ports_bitmap != NULL)
+            with_bitmap++;
+        else
+            CHECK(h->unique_dst_ports <= STATS_HOST_INLINE_PORTS);
+    }
+    CHECK(with_bitmap == 1);
 
     const host_stats_t *top_hosts[3];
     const port_stats_t *top_ports[5];
@@ -679,6 +710,381 @@ static void test_demo_hosts_ports_flows(void)
         CHECK(top_ports[0]->packets >= top_ports[1]->packets);
     CHECK(top_flows[0]->packets == max_pkts); /* brute-force reference */
 
+    stats_free(&ctx);
+}
+
+/* ---- FIX-03: units, compact port set, retransmission vs reordering ---- */
+
+/* One payload segment of the tcp_data() flow (192.0.2.1:sport -> :443). */
+static void seg(stats_ctx_t *ctx, double ts, uint16_t sport, uint32_t seq,
+                uint32_t len)
+{
+    parsed_packet_t p = tcp_data(ts, seq);
+    p.src_port = sport;
+    p.payload_len = len;
+    CHECK(stats_update(ctx, &p) == PCAPSTAT_OK);
+}
+
+static const flow_stats_t *flow_by_sport(const stats_ctx_t *ctx,
+                                         uint16_t sport)
+{
+    ht_iter_t it = ht_iter_begin(ctx->flows_ht);
+    const void *key;
+    size_t key_len;
+    void *value;
+    while (ht_iter_next(&it, &key, &key_len, &value)) {
+        const flow_stats_t *f = (const flow_stats_t *)value;
+        if (f->proto == IPPROTO_TCP && f->src_port == sport)
+            return f;
+    }
+    return NULL;
+}
+
+/* Global counters must equal the sums over every flow. */
+static void check_global_seq_counters(const stats_ctx_t *ctx)
+{
+    uint64_t retrans = 0, ooo = 0;
+    ht_iter_t it = ht_iter_begin(ctx->flows_ht);
+    const void *key;
+    size_t key_len;
+    void *value;
+    while (ht_iter_next(&it, &key, &key_len, &value)) {
+        const flow_stats_t *f = (const flow_stats_t *)value;
+        retrans += f->retransmissions;
+        ooo += f->out_of_order;
+    }
+    CHECK(ctx->tcp_retransmissions == retrans);
+    CHECK(ctx->tcp_out_of_order == ooo);
+}
+
+static size_t bitmap_popcount(const uint8_t *bitmap)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < STATS_DST_PORT_BITMAP_BYTES; ++i)
+        for (uint8_t b = bitmap[i]; b != 0; b &= (uint8_t)(b - 1))
+            n++;
+    return n;
+}
+
+static bool bitmap_has(const uint8_t *bitmap, uint16_t port)
+{
+    return (bitmap[port / 8] & (1U << (port % 8))) != 0;
+}
+
+/* H4: avg_bps was bytes/s while the report prints it as kbps/Mbps. */
+static void test_avg_bps_is_bits_per_second(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+    feed(&ctx, 1.0, 1000, IPPROTO_UDP, 0);
+    feed(&ctx, 3.0, 500, IPPROTO_UDP, 0);
+    CHECK(stats_finalize(&ctx) == PCAPSTAT_OK);
+    CHECK(ctx.duration_sec == 2.0);
+    CHECK(ctx.avg_pps == 1.0);
+    CHECK(ctx.avg_bps == 8.0 * 1500.0 / 2.0); /* 6000 bit/s, not 750 */
+    CHECK(ctx.avg_bps == 8.0 * (double)ctx.total_bytes / ctx.duration_sec);
+    stats_free(&ctx);
+}
+
+/* C3: every host used to embed an 8 KB bitmap (856 MB RSS for 100k
+ * spoofed sources). Receive-only hosts must not own any port storage. */
+static void test_receive_only_host_has_no_port_storage(void)
+{
+    CHECK(sizeof(host_stats_t) <= 256); /* was > 8192 */
+
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    /* Host 1 SYN-scans 100 ports of host 2; host 2 answers SYN+ACK/RST. */
+    for (uint16_t p = 1000; p < 1100; ++p) {
+        send_pkt(&ctx, net_pkt(1.0, IPPROTO_TCP, 1, 2, 40000, p, TH_SYN, 60));
+        send_pkt(&ctx, net_pkt(1.0, IPPROTO_TCP, 2, 1, p, 40000,
+                               (p % 2) ? (TH_SYN | TH_ACK) : TH_RST, 60));
+    }
+    /* Host 5 sends UDP to 50 ports of host 4 (never answered). */
+    for (uint16_t p = 2000; p < 2050; ++p)
+        send_pkt(&ctx, net_pkt(2.0, IPPROTO_UDP, 5, 4, 5000, p, 0, 60));
+    /* Host 3 probes exactly the inline capacity. */
+    for (uint16_t p = 1; p <= STATS_HOST_INLINE_PORTS; ++p)
+        send_pkt(&ctx, net_pkt(3.0, IPPROTO_TCP, 3, 6, 40000, p, TH_SYN, 60));
+
+    const host_stats_t *h1 = find_host(&ctx, 1);
+    const host_stats_t *h2 = find_host(&ctx, 2);
+    const host_stats_t *h3 = find_host(&ctx, 3);
+    const host_stats_t *h4 = find_host(&ctx, 4);
+    const host_stats_t *h5 = find_host(&ctx, 5);
+    const host_stats_t *h6 = find_host(&ctx, 6);
+    CHECK(h1 && h2 && h3 && h4 && h5 && h6);
+
+    /* Receivers: no probed ports, no bitmap. */
+    CHECK(h2->unique_dst_ports == 0 && h2->dst_ports_bitmap == NULL);
+    CHECK(h4->unique_dst_ports == 0 && h4->dst_ports_bitmap == NULL);
+    CHECK(h6->unique_dst_ports == 0 && h6->dst_ports_bitmap == NULL);
+    CHECK(h2->rx_packets == 100 && h4->rx_packets == 50);
+
+    /* At capacity: still inline. Beyond it: promoted. */
+    CHECK(h3->unique_dst_ports == STATS_HOST_INLINE_PORTS);
+    CHECK(h3->dst_ports_bitmap == NULL);
+    CHECK(h1->unique_dst_ports == 100 && h1->dst_ports_bitmap != NULL);
+    CHECK(h5->unique_dst_ports == 50 && h5->dst_ports_bitmap != NULL);
+
+    stats_free(&ctx); /* LSan: promoted bitmaps are released */
+}
+
+/* C3: promotion inline -> bitmap keeps unique_dst_ports exact (port 0
+ * ignored, TCP and UDP share one set, inline ports carried over). */
+static void test_port_set_promotion_exact(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    for (uint16_t p = 1; p <= 16; ++p)
+        send_pkt(&ctx, net_pkt(1.0, IPPROTO_TCP, 1, 2, 40000, p, TH_SYN, 60));
+    for (uint16_t p = 16; p >= 1; --p) /* duplicates, reverse order */
+        send_pkt(&ctx, net_pkt(1.1, IPPROTO_TCP, 1, 2, 40001, p, TH_SYN, 60));
+    send_pkt(&ctx, net_pkt(1.2, IPPROTO_TCP, 1, 2, 40000, 0, TH_SYN, 60));
+    send_pkt(&ctx, net_pkt(1.3, IPPROTO_UDP, 1, 2, 5000, 5, 0, 60)); /* shared */
+    send_pkt(&ctx, net_pkt(1.4, IPPROTO_UDP, 1, 2, 5000, 0, 0, 60));
+
+    const host_stats_t *h = find_host(&ctx, 1);
+    CHECK(h != NULL);
+    CHECK(h->unique_dst_ports == 16);
+    CHECK(h->dst_ports_bitmap == NULL);
+
+    send_pkt(&ctx, net_pkt(2.0, IPPROTO_TCP, 1, 2, 40000, 17, TH_SYN, 60));
+    CHECK(h->unique_dst_ports == 17);
+    CHECK(h->dst_ports_bitmap != NULL);
+    CHECK(bitmap_popcount(h->dst_ports_bitmap) == 17);
+
+    /* Every pre-promotion port is a duplicate now. */
+    for (uint16_t p = 1; p <= 17; ++p)
+        send_pkt(&ctx, net_pkt(2.1, IPPROTO_TCP, 1, 2, 40002, p, TH_SYN, 60));
+    send_pkt(&ctx, net_pkt(2.2, IPPROTO_UDP, 1, 2, 5000, 3, 0, 60));
+    send_pkt(&ctx, net_pkt(2.3, IPPROTO_TCP, 1, 2, 40000, 0, TH_SYN, 60));
+    CHECK(h->unique_dst_ports == 17);
+
+    for (uint16_t p = 18; p <= 40; ++p)
+        send_pkt(&ctx, net_pkt(3.0, IPPROTO_TCP, 1, 2, 40000, p, TH_SYN, 60));
+    for (uint16_t p = 30; p <= 60; ++p) /* 30..40 overlap TCP */
+        send_pkt(&ctx, net_pkt(3.1, IPPROTO_UDP, 1, 2, 5001, p, 0, 60));
+    send_pkt(&ctx, net_pkt(3.2, IPPROTO_TCP, 1, 2, 40000, 65535, TH_SYN, 60));
+    send_pkt(&ctx, net_pkt(3.3, IPPROTO_TCP, 1, 2, 40000, 65535, TH_SYN, 60));
+
+    CHECK(h->unique_dst_ports == 61);
+    CHECK(bitmap_popcount(h->dst_ports_bitmap) == 61);
+    for (uint16_t p = 1; p <= 60; ++p)
+        CHECK(bitmap_has(h->dst_ports_bitmap, p));
+    CHECK(bitmap_has(h->dst_ports_bitmap, 65535));
+    CHECK(!bitmap_has(h->dst_ports_bitmap, 0));
+    CHECK(!bitmap_has(h->dst_ports_bitmap, 61));
+    CHECK(find_host(&ctx, 2)->dst_ports_bitmap == NULL);
+    stats_free(&ctx);
+}
+
+/* Every possible port once (and port 0): 65535 distinct, exactly. */
+static void test_port_set_full_sweep(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+    for (uint32_t p = 0; p <= 65535; ++p)
+        send_pkt(&ctx, net_pkt(1.0, IPPROTO_TCP, 1, 2, 40000, (uint16_t)p,
+                               TH_SYN, 60));
+    const host_stats_t *h = find_host(&ctx, 1);
+    CHECK(h != NULL && h->dst_ports_bitmap != NULL);
+    CHECK(h->unique_dst_ports == 65535);
+    CHECK(bitmap_popcount(h->dst_ports_bitmap) == 65535);
+    stats_free(&ctx);
+}
+
+/* H6: 30 segments with 10 adjacent swaps 0.1 ms apart used to report 10
+ * retransmissions (33 %). Reordering is not retransmission. */
+static void test_sub_ms_swaps_are_out_of_order(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    size_t order[30];
+    for (size_t i = 0; i < 30; ++i)
+        order[i] = i;
+    for (size_t j = 0; j < 10; ++j) { /* swap (1,2) (4,5) ... (28,29) */
+        size_t a = 3 * j + 1;
+        order[a] = a + 1;
+        order[a + 1] = a;
+    }
+    for (size_t k = 0; k < 30; ++k)
+        seg(&ctx, 10.0 + 0.0001 * (double)k, 40000,
+            1000u + 100u * (uint32_t)order[k], 100);
+
+    const flow_stats_t *f = only_flow(&ctx);
+    CHECK(f->packets == 30);
+    CHECK(f->retransmissions == 0); /* old code: 10 */
+    CHECK(f->out_of_order == 10);
+    CHECK(!f->has_hole);
+    CHECK(f->next_seq == 1000u + 100u * 30u);
+    CHECK(ctx.tcp_retransmissions == 0 && ctx.tcp_out_of_order == 10);
+    stats_free(&ctx);
+}
+
+/* H6: exact duplicates are retransmissions, also within the window. */
+static void test_exact_duplicate_is_retransmission(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    seg(&ctx, 1.0000, 40000, 1000, 100);
+    seg(&ctx, 1.0010, 40000, 1100, 100);
+    seg(&ctx, 1.0012, 40000, 1100, 100); /* dup 0.2 ms later: no hole */
+    CHECK(only_flow(&ctx)->retransmissions == 1);
+    seg(&ctx, 1.0110, 40000, 1000, 100); /* dup 10 ms later */
+    CHECK(only_flow(&ctx)->retransmissions == 2);
+
+    /* Duplicate of the segment that opened a hole is not a hole fill. */
+    seg(&ctx, 2.0000, 40000, 1300, 100);  /* hole [1200, 1300) */
+    seg(&ctx, 2.0001, 40000, 1300, 100);  /* dup                -> retrans */
+    seg(&ctx, 2.0002, 40000, 1200, 100);  /* fill               -> ooo     */
+    const flow_stats_t *f = only_flow(&ctx);
+    CHECK(f->retransmissions == 3);
+    CHECK(f->out_of_order == 1);
+    CHECK(ctx.tcp_retransmissions == 3 && ctx.tcp_out_of_order == 1);
+    stats_free(&ctx);
+}
+
+/* H6: a hole filled after the window is a real (loss) retransmission. */
+static void test_late_hole_fill_is_retransmission(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    seg(&ctx, 2.0000, 40000, 1000, 100);
+    seg(&ctx, 2.0000, 40000, 1200, 100); /* hole [1100, 1200) at t=2.0 */
+    seg(&ctx, 2.0025, 40000, 1100, 50);  /* 2.5 ms: ooo, hole [1150,1200) */
+    CHECK(only_flow(&ctx)->out_of_order == 1);
+    seg(&ctx, 2.0035, 40000, 1150, 50);  /* 3.5 ms: window over -> retrans */
+    const flow_stats_t *f = only_flow(&ctx);
+    CHECK(f->out_of_order == 1);
+    CHECK(f->retransmissions == 1);
+    CHECK(!f->has_hole);
+
+    /* Classic loss: RTO retransmission 200 ms later. */
+    seg(&ctx, 3.0000, 40000, 1400, 100); /* hole [1300, 1400) */
+    seg(&ctx, 3.2000, 40000, 1300, 100);
+    CHECK(f->retransmissions == 2 && f->out_of_order == 1);
+    check_global_seq_counters(&ctx);
+    stats_free(&ctx);
+}
+
+/* H6: multi-segment holes filled in any order within the window. */
+static void test_multi_segment_hole_fills(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    /* Reverse fill: A E D C B -> hole [100,400) shrinks from both ends. */
+    seg(&ctx, 1.0000, 40000, 0, 100);
+    seg(&ctx, 1.0001, 40000, 400, 100);
+    seg(&ctx, 1.0002, 40000, 300, 100); /* end edge   -> [100,300) */
+    seg(&ctx, 1.0003, 40000, 100, 100); /* start edge -> [200,300) */
+    seg(&ctx, 1.0004, 40000, 200, 100); /* closes the hole */
+    const flow_stats_t *f = only_flow(&ctx);
+    CHECK(f->out_of_order == 3 && f->retransmissions == 0);
+    CHECK(!f->has_hole);
+
+    /* Middle fill first: F J H G I. */
+    seg(&ctx, 2.0000, 40000, 500, 100);
+    seg(&ctx, 2.0001, 40000, 900, 100); /* hole [600,900) */
+    seg(&ctx, 2.0002, 40000, 700, 100); /* middle: hole unchanged */
+    seg(&ctx, 2.0003, 40000, 600, 100);
+    seg(&ctx, 2.0004, 40000, 800, 100);
+    CHECK(f->out_of_order == 6 && f->retransmissions == 0);
+    seg(&ctx, 2.0500, 40000, 700, 100); /* dup after window */
+    CHECK(f->retransmissions == 1);
+
+    /* Second gap while a hole is open: one interval covers both. */
+    seg(&ctx, 3.0000, 40000, 1000, 100);
+    seg(&ctx, 3.0001, 40000, 1200, 100); /* hole [1100,1200) */
+    seg(&ctx, 3.0002, 40000, 1400, 100); /* extended to [1100,1400) */
+    seg(&ctx, 3.0003, 40000, 1100, 100);
+    seg(&ctx, 3.0004, 40000, 1300, 100);
+    CHECK(f->out_of_order == 8 && f->retransmissions == 1);
+    CHECK(f->next_seq == 1500);
+    check_global_seq_counters(&ctx);
+    stats_free(&ctx);
+}
+
+/* H6: reordering across the 2^32 sequence wrap. */
+static void test_out_of_order_across_seq_wrap(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    seg(&ctx, 1.0000, 40000, 0xFFFFFF00u, 0x80); /* -> next 0xFFFFFF80 */
+    seg(&ctx, 1.0001, 40000, 0x00000000u, 0x80); /* hole [..FF80, 0) */
+    seg(&ctx, 1.0002, 40000, 0xFFFFFF80u, 0x80); /* ends exactly at 0 */
+    const flow_stats_t *f = only_flow(&ctx);
+    CHECK(f->out_of_order == 1 && f->retransmissions == 0);
+    CHECK(!f->has_hole && f->next_seq == 0x80u);
+    seg(&ctx, 1.0100, 40000, 0xFFFFFF00u, 0x80); /* behind across wrap */
+    CHECK(f->retransmissions == 1);
+    seg(&ctx, 1.0200, 40000, 0x00000080u, 0x80); /* in order */
+    CHECK(f->retransmissions == 1 && f->out_of_order == 1);
+    CHECK(f->next_seq == 0x100u);
+    stats_free(&ctx);
+}
+
+/* A repacketized retransmission (old + new bytes) counts once and moves
+ * next_seq forward, so the following segment is new data. */
+static void test_partial_overlap_is_retransmission(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    seg(&ctx, 1.000, 40000, 1000, 100);
+    seg(&ctx, 1.001, 40000, 1100, 100);
+    seg(&ctx, 1.200, 40000, 1150, 100); /* 1150..1250 overlaps 1150..1200 */
+    const flow_stats_t *f = only_flow(&ctx);
+    CHECK(f->retransmissions == 1);
+    CHECK(f->next_seq == 1250);
+    seg(&ctx, 1.201, 40000, 1250, 100);
+    CHECK(f->retransmissions == 1 && f->out_of_order == 0);
+    stats_free(&ctx);
+}
+
+/* H5: global counters cover every flow (the report summed only the
+ * top-128 flows) and equal the per-flow sums. */
+static void test_global_tcp_counters_cover_all_flows(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    /* 200 flows, each: 1 retransmission + 1 out-of-order segment. */
+    for (uint16_t s = 0; s < 200; ++s) {
+        uint16_t sport = (uint16_t)(30000 + s);
+        double t = 1.0 + s;
+        seg(&ctx, t, sport, 0, 100);
+        seg(&ctx, t + 0.0001, sport, 200, 100); /* hole [100,200) */
+        seg(&ctx, t + 0.0002, sport, 100, 100); /* ooo */
+        seg(&ctx, t + 0.5000, sport, 0, 100);   /* retrans */
+    }
+    /* UDP and zero-payload TCP never count. */
+    send_pkt(&ctx, net_pkt(500.0, IPPROTO_UDP, 1, 2, 5000, 53, 0, 60));
+    parsed_packet_t p = tcp_data(501.0, 0);
+    p.src_port = 30000;
+    p.payload_len = 0;
+    send_pkt(&ctx, p);
+
+    CHECK(ht_count(ctx.flows_ht) == 201);
+    CHECK(ctx.tcp_retransmissions == 200);
+    CHECK(ctx.tcp_out_of_order == 200);
+    check_global_seq_counters(&ctx);
+    const flow_stats_t *f = flow_by_sport(&ctx, 30199);
+    CHECK(f != NULL && f->retransmissions == 1 && f->out_of_order == 1);
+
+    const flow_stats_t *top[128];
+    uint64_t top_sum = 0;
+    size_t n = stats_top_flows(&ctx, top, 128);
+    for (size_t i = 0; i < n; ++i)
+        top_sum += top[i]->retransmissions;
+    CHECK(top_sum < ctx.tcp_retransmissions); /* why the global exists */
     stats_free(&ctx);
 }
 
@@ -714,5 +1120,17 @@ int main(void)
     RUN(test_top_n_bytes_vs_packets_and_ties);
     RUN(test_service_names);
     RUN(test_demo_hosts_ports_flows);
+
+    RUN(test_avg_bps_is_bits_per_second);
+    RUN(test_receive_only_host_has_no_port_storage);
+    RUN(test_port_set_promotion_exact);
+    RUN(test_port_set_full_sweep);
+    RUN(test_sub_ms_swaps_are_out_of_order);
+    RUN(test_exact_duplicate_is_retransmission);
+    RUN(test_late_hole_fill_is_retransmission);
+    RUN(test_multi_segment_hole_fills);
+    RUN(test_out_of_order_across_seq_wrap);
+    RUN(test_partial_overlap_is_retransmission);
+    RUN(test_global_tcp_counters_cover_all_flows);
     return 0;
 }

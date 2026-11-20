@@ -28,6 +28,11 @@ typedef struct ht ht_t;
  *
  * Capacity grows automatically while the table's load factor is above 0.7.
  * ht_t instances are allocated by ht_create() and freed by ht_destroy().
+ *
+ * Bucket placement: keys are hashed with 64-bit FNV-1a, the hash is passed
+ * through the murmur3 `fmix64` finalizer, and the result is masked with
+ * `capacity - 1` (capacity is always a power of two). The finalizer is
+ * required because the low bits of raw FNV-1a mix poorly.
  */
 struct ht {
     ht_entry_t **buckets;
