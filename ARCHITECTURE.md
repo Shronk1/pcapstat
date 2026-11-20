@@ -124,6 +124,23 @@ each packet into a stack-local `parsed_packet_t`, invoking a user callback.
   `stats_free()`; parsed packets remain callback-borrowed and are never
   copied.
 
+* **Hosts and ports.** `hosts_ht` stores per-IP transmit/receive counters,
+  TCP SYN/RST counters, and one 8 KB fixed `dst_ports_bitmap[8192]` for
+  65,536 distinct destination ports. `ports_ht` aggregates packet/byte
+  counts by `{proto, dst_port}`; service names are a static lookup.
+* **Flows and retransmissions.** `flows_ht` stores directional
+  `{ip_version, src_ip, dst_ip, src_port, dst_port, proto}` aggregates.
+  Payload-bearing TCP packets use wrap-safe signed modular sequence
+  arithmetic: `pkt->timestamp >= last_seq_ts` and
+  `(int32_t)(tcp_seq - max_seq) <= 0` identifies a retransmission candidate.
+* **Streaming memory model.** Host, port, and flow entries are sparse
+  hash-table objects; no packet or capture-wide per-timestamp array is
+  retained. Each host has a fixed 8 KB bitmap and no nested allocations.
+* **Ranking complexity.** Top-N export iterates its table, copies table
+  pointers into a temporary `O(n)` array, sorts with `qsort()`, and returns
+  borrowed pointers. Results remain valid until `stats_free()`; table
+  iteration and sorting are O(n) and O(n log n), respectively.
+
 ## Anomaly Detection
 
 *Placeholder — to be completed in TASK-08.*

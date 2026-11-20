@@ -2,8 +2,9 @@
  * @file stats.h
  * @brief Streaming statistics engine for parsed network packets.
  *
- * The engine retains only aggregate counters and sparse one-second buckets.
- * Parsed packets are borrowed callback data and are never stored.
+ * The engine retains only aggregate counters, sparse one-second buckets and
+ * per-host / per-port / per-flow aggregates. Parsed packets are borrowed
+ * callback data and are never stored.
  *
  * Counting invariants (every ingested packet is counted exactly once in
  * the global category counters):
@@ -22,6 +23,7 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /** @brief Number of fixed packet-size histogram bins. */
@@ -59,12 +61,83 @@ typedef struct {
     uint64_t udp_packets_max;
 } ts_bucket_t;
 
+/** @brief Number of bytes in the fixed destination-port bitmap. */
+#define STATS_DST_PORT_BITMAP_BYTES 8192
+
+/**
+ * @brief Aggregate traffic attributed to one IP host.
+ *
+ * The object is table-owned and is reachable only through @ref stats_ctx_t.
+ * Created for every source and destination address of non-malformed IP
+ * packets (so receive-only hosts get an entry, and its 8 KB bitmap, too).
+ */
+typedef struct {
+    uint8_t  ip_version; /**< IP version (4 or 6). */
+    uint8_t  ip[16];     /**< IPv4 in bytes 0..3 or full IPv6 address. */
+    uint64_t tx_packets; /**< Packets sent by this host. */
+    uint64_t tx_bytes;   /**< Wire bytes sent. */
+    uint64_t rx_packets; /**< Packets received. */
+    uint64_t rx_bytes;   /**< Wire bytes received. */
+    uint64_t syn_sent;     /**< Pure SYN (SYN set, ACK clear) sent. */
+    uint64_t syn_ack_recv; /**< SYN+ACK received. */
+    uint64_t rst_sent;     /**< Packets with RST sent. */
+    uint64_t rst_recv;     /**< Packets with RST received. */
+
+    /**
+     * Distinct destination ports this host probed, for port-scan
+     * detection. A port is recorded (in one bitmap shared by TCP and UDP,
+     * so TCP/80 and UDP/80 count once) when the host sends
+     *  - a TCP pure SYN, or
+     *  - a UDP datagram that is NOT a reply, i.e. no flow in the opposite
+     *    direction (dst -> src, swapped ports) had been seen before.
+     * Port 0 is ignored. The reply rule keeps servers (DNS, NTP, ...),
+     * which answer many ephemeral client ports, from looking like
+     * scanners. NULL/FIN/XMAS TCP scans are not tracked here.
+     */
+    uint32_t unique_dst_ports;
+
+    /** Bit p set = port p probed (byte p / 8, bit p % 8). */
+    uint8_t  dst_ports_bitmap[STATS_DST_PORT_BITMAP_BYTES];
+} host_stats_t;
+
+/**
+ * @brief Aggregate traffic for one IP protocol and destination port.
+ */
+typedef struct {
+    uint8_t  proto;     /**< IP protocol number (TCP or UDP). */
+    uint16_t dst_port;  /**< Destination port in host byte order. */
+    uint64_t packets;
+    uint64_t bytes;
+} port_stats_t;
+
+/**
+ * @brief Aggregate statistics for one directional IPv4/IPv6 5-tuple.
+ */
+typedef struct {
+    uint8_t  ip_version; /**< IP version (4 or 6). */
+    uint8_t  src_ip[16]; /**< Source IP address. */
+    uint8_t  dst_ip[16]; /**< Destination IP address. */
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t  proto;
+    double   first_ts;       /**< Valid only if has_timestamp. */
+    double   last_ts;        /**< Valid only if has_timestamp. */
+    uint64_t packets;
+    uint64_t bytes;
+    uint8_t  tcp_flags_seen; /**< OR of all TCP flag bytes seen. */
+    bool     has_timestamp;  /**< A usable timestamp was seen. */
+    bool     has_seq;        /**< A TCP data segment was seen. */
+    uint32_t max_seq;        /**< Retransmission baseline; valid if has_seq. */
+    double   last_seq_ts;    /**< Time of the baseline; valid if has_seq. */
+    uint64_t retransmissions; /**< Candidate TCP retransmissions. */
+} flow_stats_t;
+
 /**
  * @brief Streaming traffic statistics context.
  *
  * Caller allocates this struct, stats_init() initializes it, and
- * stats_free() releases only its owned tables and timeline. The
- * host/port/flow hash-table pointers are reserved for future stats phases.
+ * stats_free() releases everything it owns: the time-series, host, port
+ * and flow tables (with their payload objects) and the timeline.
  *
  * `files_processed` is not touched by this module; the caller (main) must
  * increment it after each successfully processed file.
@@ -73,6 +146,9 @@ typedef struct {
  * is below 9.0e18 (so floor() fits in int64_t). Packets with unusable
  * timestamps are counted in all counters but are excluded from
  * first_ts/last_ts and from the time-series buckets.
+ *
+ * Hosts, ports and flows are filled only for non-malformed packets with
+ * `ip_version != 0`; ports and flows only for TCP/UDP.
  */
 typedef struct {
     uint64_t files_processed;
@@ -116,17 +192,64 @@ typedef struct {
     ts_bucket_t *timeline;
     size_t timeline_count;
 
-    /* Reserved for TASK-07; payload ownership remains with stats_free(). */
-    ht_t *hosts_ht;
-    ht_t *ports_ht;
-    ht_t *flows_ht;
+    ht_t *hosts_ht;   /**< key {ip_version, ip[16]} -> host_stats_t. */
+    ht_t *ports_ht;   /**< key {proto, dst_port}    -> port_stats_t. */
+    ht_t *flows_ht;   /**< directional 5-tuple      -> flow_stats_t. */
 } stats_ctx_t;
+
+/**
+ * @brief Map a protocol and port to a common service name.
+ *
+ * The returned string is static and must not be freed or modified.
+ * Most names are protocol-independent; "UDP-Data" (9999) is UDP-only.
+ *
+ * @param proto IP protocol number.
+ * @param port Destination port in host byte order.
+ * @return ASCII service name, or "Unknown".
+ */
+const char *stats_port_service_name(uint8_t proto, uint16_t port);
+
+/**
+ * @brief Export borrowed pointers to the highest-volume hosts.
+ *
+ * Ordered by total host bytes descending, then packets, then address
+ * (deterministic). Returned pointers are borrowed from @p ctx and remain
+ * valid until stats_free(). The caller owns @p out only.
+ *
+ * @param ctx Initialized statistics context.
+ * @param out Caller-owned array of at least @p max_n pointers.
+ * @param max_n Number of slots in @p out.
+ * @return Number of pointers written (at most @p max_n). 0 means no data,
+ *         invalid arguments, or an internal allocation failure.
+ */
+size_t stats_top_hosts(const stats_ctx_t *ctx,
+                       const host_stats_t **out, size_t max_n);
+
+/**
+ * @brief Export borrowed pointers to the busiest destination ports.
+ *
+ * Ordered by packets descending, then bytes, then (proto, port). Pointers
+ * are borrowed and valid until stats_free(). See stats_top_hosts() for
+ * the return value.
+ */
+size_t stats_top_ports(const stats_ctx_t *ctx,
+                       const port_stats_t **out, size_t max_n);
+
+/**
+ * @brief Export borrowed pointers to the busiest directional flows.
+ *
+ * Ordered by packets descending, then bytes, then 5-tuple. Pointers are
+ * borrowed and valid until stats_free(). See stats_top_hosts() for the
+ * return value.
+ */
+size_t stats_top_flows(const stats_ctx_t *ctx,
+                       const flow_stats_t **out, size_t max_n);
 
 /**
  * @brief Initialize a statistics context.
  *
- * Allocates the sparse time-series hash table. The caller owns @p ctx and
- * must later call stats_free().
+ * Allocates the time-series, host, port and flow hash tables. The caller
+ * owns @p ctx and must later call stats_free().
  *
  * @param ctx Caller-owned context to initialize.
  * @return PCAPSTAT_OK on success, PCAPSTAT_ERR_ARGS if @p ctx is NULL, or
@@ -138,16 +261,17 @@ int stats_init(stats_ctx_t *ctx);
 /**
  * @brief Update all aggregate statistics with one parsed packet.
  *
- * @p pkt is borrowed and is not retained. One-second buckets are allocated
- * lazily as packets are ingested. Global counters are updated before the
- * bucket is allocated, so after PCAPSTAT_ERR_NOMEM the context is only
- * partially updated and should be discarded (the parser stops anyway).
+ * @p pkt is borrowed and is not retained. Buckets, hosts, ports and flows
+ * are allocated lazily. Global counters are updated first, so after
+ * PCAPSTAT_ERR_NOMEM the context is only partially updated (e.g. source
+ * host counted, destination not) and should be discarded; the parser
+ * stops anyway.
  *
  * @param ctx Initialized, caller-owned context.
  * @param pkt Borrowed packet populated by the parser.
  * @return PCAPSTAT_OK on success, PCAPSTAT_ERR_ARGS for NULL arguments or
- *         an uninitialized context, PCAPSTAT_ERR_NOMEM if bucket
- *         allocation or hash-table growth fails.
+ *         an uninitialized context, PCAPSTAT_ERR_NOMEM if an allocation
+ *         or hash-table growth fails.
  */
 int stats_update(stats_ctx_t *ctx, const parsed_packet_t *pkt);
 
@@ -185,7 +309,8 @@ int stats_finalize(stats_ctx_t *ctx);
 /**
  * @brief Release every allocation owned by a statistics context.
  *
- * Frees the sparse bucket table and exported timeline and resets @p ctx.
+ * Frees all tables and their payload objects and the exported timeline,
+ * then resets @p ctx. Pointers obtained from stats_top_*() become invalid.
  *
  * @param ctx Context to release; may be NULL.
  */

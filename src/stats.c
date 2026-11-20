@@ -42,6 +42,246 @@ static void free_ts_bucket(void *value)
     free(value);
 }
 
+const char *stats_port_service_name(uint8_t proto, uint16_t port)
+{
+    switch (port) {
+    case 20: return "FTP";
+    case 21: return "FTP";
+    case 22: return "SSH";
+    case 25: return "SMTP";
+    case 53: return "DNS";
+    case 67: return "DHCP";
+    case 68: return "DHCP";
+    case 80: return "HTTP";
+    case 110: return "POP3";
+    case 123: return "NTP";
+    case 137: return "NetBIOS";
+    case 139: return "NetBIOS";
+    case 143: return "IMAP";
+    case 194: return "IRC";
+    case 443: return "HTTPS";
+    case 445: return "SMB";
+    case 587: return "SMTP-Submission";
+    case 853: return "DNS-TLS";
+    case 993: return "IMAPS";
+    case 995: return "POP3S";
+    case 3306: return "MySQL";
+    case 5432: return "PostgreSQL";
+    case 8080: return "HTTP-Alt";
+    case 8081: return "HTTP-Alt";
+    case 9999:
+        /* Demo/test traffic only; meaningful for UDP. */
+        return proto == IPPROTO_UDP ? "UDP-Data" : "Unknown";
+    default: return "Unknown";
+    }
+}
+
+/* ---- Top-N comparators ------------------------------------------------ */
+
+/* Descending order for counters (larger value sorts first). */
+static int cmp_desc_u64(uint64_t a, uint64_t b)
+{
+    if (a < b)
+        return 1;
+    if (a > b)
+        return -1;
+    return 0;
+}
+
+/* Ascending order for tie-breaks on keys. */
+static int cmp_asc_u64(uint64_t a, uint64_t b)
+{
+    if (a < b)
+        return -1;
+    if (a > b)
+        return 1;
+    return 0;
+}
+
+static int compare_host_volume(const void *left, const void *right)
+{
+    const host_stats_t *a = *(const host_stats_t *const *)left;
+    const host_stats_t *b = *(const host_stats_t *const *)right;
+    int c;
+
+    c = cmp_desc_u64(a->tx_bytes + a->rx_bytes,
+                     b->tx_bytes + b->rx_bytes);
+    if (c != 0)
+        return c;
+    c = cmp_desc_u64(a->tx_packets + a->rx_packets,
+                     b->tx_packets + b->rx_packets);
+    if (c != 0)
+        return c;
+
+    /* Deterministic tie-break by address. */
+    c = cmp_asc_u64(a->ip_version, b->ip_version);
+    if (c != 0)
+        return c;
+    return memcmp(a->ip, b->ip, sizeof(a->ip));
+}
+
+static int compare_port_volume(const void *left, const void *right)
+{
+    const port_stats_t *a = *(const port_stats_t *const *)left;
+    const port_stats_t *b = *(const port_stats_t *const *)right;
+    int c;
+
+    c = cmp_desc_u64(a->packets, b->packets);
+    if (c != 0)
+        return c;
+    c = cmp_desc_u64(a->bytes, b->bytes);
+    if (c != 0)
+        return c;
+
+    /* Deterministic tie-break by key. */
+    c = cmp_asc_u64(a->proto, b->proto);
+    if (c != 0)
+        return c;
+    return cmp_asc_u64(a->dst_port, b->dst_port);
+}
+
+static int compare_flow_volume(const void *left, const void *right)
+{
+    const flow_stats_t *a = *(const flow_stats_t *const *)left;
+    const flow_stats_t *b = *(const flow_stats_t *const *)right;
+    int c;
+
+    c = cmp_desc_u64(a->packets, b->packets);
+    if (c != 0)
+        return c;
+    c = cmp_desc_u64(a->bytes, b->bytes);
+    if (c != 0)
+        return c;
+
+    /* Deterministic tie-break by 5-tuple. */
+    c = cmp_asc_u64(a->ip_version, b->ip_version);
+    if (c != 0)
+        return c;
+    c = memcmp(a->src_ip, b->src_ip, sizeof(a->src_ip));
+    if (c != 0)
+        return c;
+    c = memcmp(a->dst_ip, b->dst_ip, sizeof(a->dst_ip));
+    if (c != 0)
+        return c;
+    c = cmp_asc_u64(a->src_port, b->src_port);
+    if (c != 0)
+        return c;
+    c = cmp_asc_u64(a->dst_port, b->dst_port);
+    if (c != 0)
+        return c;
+    return cmp_asc_u64(a->proto, b->proto);
+}
+
+size_t stats_top_hosts(const stats_ctx_t *ctx,
+                       const host_stats_t **out, size_t max_n)
+{
+    if (ctx == NULL || ctx->hosts_ht == NULL || (out == NULL && max_n != 0))
+        return 0;
+    if (max_n == 0)
+        return 0;
+
+    size_t count = ht_count(ctx->hosts_ht);
+    if (count == 0)
+        return 0;
+    const host_stats_t **values =
+        (const host_stats_t **)malloc(count * sizeof(*values));
+    if (values == NULL)
+        return 0;
+
+    ht_iter_t it = ht_iter_begin(ctx->hosts_ht);
+    const void *key;
+    size_t key_len;
+    void *value;
+    size_t index = 0;
+    while (ht_iter_next(&it, &key, &key_len, &value)) {
+        (void)key;
+        (void)key_len;
+        if (value != NULL)
+            values[index++] = (const host_stats_t *)value;
+    }
+    count = index;
+    qsort(values, count, sizeof(*values), compare_host_volume);
+    if (count > max_n)
+        count = max_n;
+    memcpy(out, values, count * sizeof(*out));
+    free(values);
+    return count;
+}
+
+size_t stats_top_ports(const stats_ctx_t *ctx,
+                       const port_stats_t **out, size_t max_n)
+{
+    if (ctx == NULL || ctx->ports_ht == NULL || (out == NULL && max_n != 0))
+        return 0;
+    if (max_n == 0)
+        return 0;
+
+    size_t count = ht_count(ctx->ports_ht);
+    if (count == 0)
+        return 0;
+    const port_stats_t **values =
+        (const port_stats_t **)malloc(count * sizeof(*values));
+    if (values == NULL)
+        return 0;
+
+    ht_iter_t it = ht_iter_begin(ctx->ports_ht);
+    const void *key;
+    size_t key_len;
+    void *value;
+    size_t index = 0;
+    while (ht_iter_next(&it, &key, &key_len, &value)) {
+        (void)key;
+        (void)key_len;
+        if (value != NULL)
+            values[index++] = (const port_stats_t *)value;
+    }
+    count = index;
+    qsort(values, count, sizeof(*values), compare_port_volume);
+    if (count > max_n)
+        count = max_n;
+    memcpy(out, values, count * sizeof(*out));
+    free(values);
+    return count;
+}
+
+size_t stats_top_flows(const stats_ctx_t *ctx,
+                       const flow_stats_t **out, size_t max_n)
+{
+    if (ctx == NULL || ctx->flows_ht == NULL || (out == NULL && max_n != 0))
+        return 0;
+    if (max_n == 0)
+        return 0;
+
+    size_t count = ht_count(ctx->flows_ht);
+    if (count == 0)
+        return 0;
+    const flow_stats_t **values =
+        (const flow_stats_t **)malloc(count * sizeof(*values));
+    if (values == NULL)
+        return 0;
+
+    ht_iter_t it = ht_iter_begin(ctx->flows_ht);
+    const void *key;
+    size_t key_len;
+    void *value;
+    size_t index = 0;
+    while (ht_iter_next(&it, &key, &key_len, &value)) {
+        (void)key;
+        (void)key_len;
+        if (value != NULL)
+            values[index++] = (const flow_stats_t *)value;
+    }
+    count = index;
+    qsort(values, count, sizeof(*values), compare_flow_volume);
+    if (count > max_n)
+        count = max_n;
+    memcpy(out, values, count * sizeof(*out));
+    free(values);
+    return count;
+}
+
+/* ---- Lifecycle -------------------------------------------------------- */
+
 int stats_init(stats_ctx_t *ctx)
 {
     if (ctx == NULL)
@@ -49,8 +289,18 @@ int stats_init(stats_ctx_t *ctx)
 
     memset(ctx, 0, sizeof(*ctx));
     ctx->ts_buckets_ht = ht_create(16);
-    if (ctx->ts_buckets_ht == NULL)
+    ctx->hosts_ht = ht_create(16);
+    ctx->ports_ht = ht_create(16);
+    ctx->flows_ht = ht_create(16);
+    if (ctx->ts_buckets_ht == NULL || ctx->hosts_ht == NULL ||
+        ctx->ports_ht == NULL || ctx->flows_ht == NULL) {
+        ht_destroy(ctx->ts_buckets_ht, free_ts_bucket);
+        ht_destroy(ctx->hosts_ht, free);
+        ht_destroy(ctx->ports_ht, free);
+        ht_destroy(ctx->flows_ht, free);
+        memset(ctx, 0, sizeof(*ctx));
         return PCAPSTAT_ERR_NOMEM;
+    }
     return PCAPSTAT_OK;
 }
 
@@ -92,11 +342,237 @@ static void update_tcp_flags(stats_ctx_t *ctx, uint8_t flags)
         ctx->syn_rst_pkts++;
 }
 
+/* ---- Hash keys (memset before filling: padding is hashed) ------------- */
+
+typedef struct {
+    uint8_t ip_version;
+    uint8_t ip[16];
+} host_key_t;
+
+typedef struct {
+    uint8_t proto;
+    uint16_t dst_port;
+} port_key_t;
+
+typedef struct {
+    uint8_t ip_version;
+    uint8_t src_ip[16];
+    uint8_t dst_ip[16];
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t proto;
+} flow_key_t;
+
+/* Record @p port in the host's bitmap; ports are counted once. */
+static void mark_dst_port(host_stats_t *host, uint16_t port)
+{
+    if (port == 0)
+        return;
+
+    uint32_t byte_index = (uint32_t)port / 8;
+    uint8_t bit = (uint8_t)(1U << (port % 8));
+    if ((host->dst_ports_bitmap[byte_index] & bit) == 0) {
+        host->dst_ports_bitmap[byte_index] |= bit;
+        host->unique_dst_ports++;
+    }
+}
+
+/*
+ * A UDP datagram is a reply if the opposite-direction flow (dst -> src,
+ * ports swapped) was already seen. UDP has no handshake, so this is the
+ * only way to tell a probe from a server answering a client's ephemeral
+ * port. Must run before update_flow() creates this packet's own flow.
+ */
+static bool udp_is_reply(stats_ctx_t *ctx, const parsed_packet_t *pkt)
+{
+    flow_key_t rev;
+
+    memset(&rev, 0, sizeof(rev));
+    rev.ip_version = pkt->ip_version;
+    memcpy(rev.src_ip, pkt->dst_ip, 16);
+    memcpy(rev.dst_ip, pkt->src_ip, 16);
+    rev.src_port = pkt->dst_port;
+    rev.dst_port = pkt->src_port;
+    rev.proto = IPPROTO_UDP;
+    return ht_get(ctx->flows_ht, &rev, sizeof(rev)) != NULL;
+}
+
+static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt)
+{
+    host_key_t src_key;
+    host_key_t dst_key;
+    host_stats_t *src;
+    host_stats_t *dst;
+
+    if (pkt->ip_version == 0)
+        return PCAPSTAT_OK;
+
+    memset(&src_key, 0, sizeof(src_key));
+    memset(&dst_key, 0, sizeof(dst_key));
+    src_key.ip_version = pkt->ip_version;
+    dst_key.ip_version = pkt->ip_version;
+    memcpy(src_key.ip, pkt->src_ip, 16);
+    memcpy(dst_key.ip, pkt->dst_ip, 16);
+
+    src = (host_stats_t *)ht_get(ctx->hosts_ht, &src_key, sizeof(src_key));
+    if (src == NULL) {
+        src = (host_stats_t *)calloc(1, sizeof(*src));
+        if (src == NULL)
+            return PCAPSTAT_ERR_NOMEM;
+        src->ip_version = pkt->ip_version;
+        memcpy(src->ip, pkt->src_ip, 16);
+        if (ht_put(ctx->hosts_ht, &src_key, sizeof(src_key), src) !=
+            PCAPSTAT_OK) {
+            free(src);
+            return PCAPSTAT_ERR_NOMEM;
+        }
+    }
+    src->tx_packets++;
+    src->tx_bytes += pkt->wire_len;
+
+    dst = (host_stats_t *)ht_get(ctx->hosts_ht, &dst_key, sizeof(dst_key));
+    if (dst == NULL) {
+        dst = (host_stats_t *)calloc(1, sizeof(*dst));
+        if (dst == NULL)
+            return PCAPSTAT_ERR_NOMEM;
+        dst->ip_version = pkt->ip_version;
+        memcpy(dst->ip, pkt->dst_ip, 16);
+        if (ht_put(ctx->hosts_ht, &dst_key, sizeof(dst_key), dst) !=
+            PCAPSTAT_OK) {
+            free(dst);
+            return PCAPSTAT_ERR_NOMEM;
+        }
+    }
+    dst->rx_packets++;
+    dst->rx_bytes += pkt->wire_len;
+
+    if (pkt->proto == IPPROTO_TCP) {
+        const uint8_t syn = (uint8_t)TH_SYN;
+        const uint8_t ack = (uint8_t)TH_ACK;
+        const uint8_t rst = (uint8_t)TH_RST;
+
+        if ((pkt->tcp_flags & syn) != 0 && (pkt->tcp_flags & ack) == 0) {
+            src->syn_sent++;
+            mark_dst_port(src, pkt->dst_port);
+        }
+        if ((pkt->tcp_flags & (syn | ack)) == (syn | ack))
+            dst->syn_ack_recv++;
+        if ((pkt->tcp_flags & rst) != 0) {
+            src->rst_sent++;
+            dst->rst_recv++;
+        }
+    } else if (pkt->proto == IPPROTO_UDP) {
+        if (!udp_is_reply(ctx, pkt))
+            mark_dst_port(src, pkt->dst_port);
+    }
+    return PCAPSTAT_OK;
+}
+
+static int update_port(stats_ctx_t *ctx, const parsed_packet_t *pkt)
+{
+    port_key_t key;
+    port_stats_t *port;
+
+    if (pkt->proto != IPPROTO_TCP && pkt->proto != IPPROTO_UDP)
+        return PCAPSTAT_OK;
+
+    memset(&key, 0, sizeof(key));
+    key.proto = pkt->proto;
+    key.dst_port = pkt->dst_port;
+    port = (port_stats_t *)ht_get(ctx->ports_ht, &key, sizeof(key));
+    if (port == NULL) {
+        port = (port_stats_t *)calloc(1, sizeof(*port));
+        if (port == NULL)
+            return PCAPSTAT_ERR_NOMEM;
+        port->proto = pkt->proto;
+        port->dst_port = pkt->dst_port;
+        if (ht_put(ctx->ports_ht, &key, sizeof(key), port) != PCAPSTAT_OK) {
+            free(port);
+            return PCAPSTAT_ERR_NOMEM;
+        }
+    }
+    port->packets++;
+    port->bytes += pkt->wire_len;
+    return PCAPSTAT_OK;
+}
+
+static int update_flow(stats_ctx_t *ctx, const parsed_packet_t *pkt)
+{
+    flow_key_t key;
+    flow_stats_t *flow;
+
+    if (pkt->proto != IPPROTO_TCP && pkt->proto != IPPROTO_UDP)
+        return PCAPSTAT_OK;
+
+    memset(&key, 0, sizeof(key));
+    key.ip_version = pkt->ip_version;
+    memcpy(key.src_ip, pkt->src_ip, 16);
+    memcpy(key.dst_ip, pkt->dst_ip, 16);
+    key.src_port = pkt->src_port;
+    key.dst_port = pkt->dst_port;
+    key.proto = pkt->proto;
+
+    flow = (flow_stats_t *)ht_get(ctx->flows_ht, &key, sizeof(key));
+    if (flow == NULL) {
+        flow = (flow_stats_t *)calloc(1, sizeof(*flow));
+        if (flow == NULL)
+            return PCAPSTAT_ERR_NOMEM;
+        flow->ip_version = pkt->ip_version;
+        memcpy(flow->src_ip, pkt->src_ip, 16);
+        memcpy(flow->dst_ip, pkt->dst_ip, 16);
+        flow->src_port = pkt->src_port;
+        flow->dst_port = pkt->dst_port;
+        flow->proto = pkt->proto;
+        if (ht_put(ctx->flows_ht, &key, sizeof(key), flow) != PCAPSTAT_OK) {
+            free(flow);
+            return PCAPSTAT_ERR_NOMEM;
+        }
+        if (ts_is_usable(pkt->timestamp)) {
+            flow->first_ts = pkt->timestamp;
+            flow->last_ts = pkt->timestamp;
+            flow->has_timestamp = true;
+        }
+    } else if (ts_is_usable(pkt->timestamp)) {
+        if (!flow->has_timestamp) {
+            flow->first_ts = pkt->timestamp;
+            flow->last_ts = pkt->timestamp;
+            flow->has_timestamp = true;
+        } else {
+            if (pkt->timestamp < flow->first_ts)
+                flow->first_ts = pkt->timestamp;
+            if (pkt->timestamp > flow->last_ts)
+                flow->last_ts = pkt->timestamp;
+        }
+    }
+
+    flow->packets++;
+    flow->bytes += pkt->wire_len;
+    if (pkt->proto == IPPROTO_TCP) {
+        flow->tcp_flags_seen |= pkt->tcp_flags;
+        if (pkt->payload_len > 0) {
+            /* Wrap-safe modular comparison: seq <= max_seq. */
+            if (flow->has_seq &&
+                ts_is_usable(pkt->timestamp) &&
+                pkt->timestamp >= flow->last_seq_ts &&
+                (int32_t)(pkt->tcp_seq - flow->max_seq) <= 0) {
+                flow->retransmissions++;
+            } else {
+                flow->max_seq = pkt->tcp_seq;
+                flow->last_seq_ts =
+                    ts_is_usable(pkt->timestamp) ? pkt->timestamp : 0.0;
+            }
+            flow->has_seq = true;
+        }
+    }
+    return PCAPSTAT_OK;
+}
+
 int stats_update(stats_ctx_t *ctx, const parsed_packet_t *pkt)
 {
     if (ctx == NULL || pkt == NULL)
         return PCAPSTAT_ERR_ARGS;
-    if (ctx->ts_buckets_ht == NULL)
+    if (ctx->ts_buckets_ht == NULL || ctx->hosts_ht == NULL ||
+        ctx->ports_ht == NULL || ctx->flows_ht == NULL)
         return PCAPSTAT_ERR_ARGS;
 
     const bool ts_ok = ts_is_usable(pkt->timestamp);
@@ -130,6 +606,21 @@ int stats_update(stats_ctx_t *ctx, const parsed_packet_t *pkt)
         ctx->udp_bytes += pkt->wire_len;
     } else {
         ctx->other_packets++;
+    }
+
+    /* Hosts/ports/flows need a decoded L3 header. The parser always sets
+     * ip_version for non-malformed packets; the check keeps hand-built
+     * packets (tests) from collapsing into one all-zero flow. */
+    if (!pkt->is_malformed && pkt->ip_version != 0) {
+        int rc = update_host(ctx, pkt);
+        if (rc != PCAPSTAT_OK)
+            return rc;
+        rc = update_port(ctx, pkt);
+        if (rc != PCAPSTAT_OK)
+            return rc;
+        rc = update_flow(ctx, pkt);
+        if (rc != PCAPSTAT_OK)
+            return rc;
     }
 
     if (!ts_ok)
