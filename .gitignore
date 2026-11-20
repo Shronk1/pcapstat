@@ -2,6 +2,7 @@
 bin/
 build/
 out/
+out_multi/
 pcapstat_out/
 
 # Object and dependency files
@@ -11,3 +12,6 @@ pcapstat_out/
 # Generated assets
 *.png
 *.pdf
+
+# README screenshots
+!docs/*.png
