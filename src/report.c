@@ -12,6 +12,7 @@
 #include <cairo.h>
 #include <cairo-pdf.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,91 +128,245 @@ static void draw_rounded_rect(cairo_t *cr, double x, double y, double w, double 
     cairo_close_path(cr);
 }
 
+/* -------------------------------------------------------------------
+ * Text Fitting Helpers
+ *
+ * All table cells and single-line labels go through show_text_fit(), which
+ * guarantees the rendered string never exceeds its column budget: if the
+ * text is too wide it is cut and suffixed with "...". Multi-line text goes
+ * through wrap_text(), which also hard-breaks unbroken tokens (paths,
+ * IPv6 addresses, identifiers) that are wider than a full line.
+ * ------------------------------------------------------------------- */
+
+#define RPT_TEXT_BUF   512   /**< Scratch buffer for measured strings. */
+#define RPT_LINE_BUF   256   /**< Capacity of one wrapped line. */
+#define RPT_CELL_PAD   6.0   /**< Horizontal gap kept free before the next column. */
+#define RPT_ELLIPSIS   "..."
+#define RPT_CONTENT_W  (REPORT_PAGE_WIDTH - 2.0 * REPORT_PAGE_MARGIN)
+
+/** Rendered width of @p s in the current font (max of advance and ink box). */
+static double text_width(cairo_t *cr, const char *s)
+{
+    cairo_text_extents_t ext;
+    cairo_text_extents(cr, s, &ext);
+    double ink_right = ext.x_bearing + ext.width;
+    return (ink_right > ext.x_advance) ? ink_right : ext.x_advance;
+}
+
+/** Width of the first @p n bytes of @p s followed by @p suffix. */
+static double prefix_width(cairo_t *cr, const char *s, size_t n, const char *suffix)
+{
+    char buf[RPT_TEXT_BUF];
+    size_t slen = strlen(suffix);
+    if (n + slen >= sizeof(buf)) {
+        n = sizeof(buf) - 1 - slen;
+    }
+    memcpy(buf, s, n);
+    memcpy(buf + n, suffix, slen);
+    buf[n + slen] = '\0';
+    return text_width(cr, buf);
+}
+
+/** Move @p n back so it does not split a UTF-8 multi-byte sequence. */
+static size_t utf8_floor(const char *s, size_t n)
+{
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) {
+        n--;
+    }
+    return n;
+}
+
 /**
- * @brief Wrap long text into an array of lines based on Cairo text extents.
+ * Largest byte count n <= @p len such that s[0..n) + @p suffix fits in
+ * @p max_w. Binary search: glyph advances are non-negative, so width is
+ * monotonic in n.
+ */
+static size_t fit_prefix_len(cairo_t *cr, const char *s, size_t len,
+                             const char *suffix, double max_w)
+{
+    size_t lo = 0, hi = len;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo + 1) / 2;
+        if (prefix_width(cr, s, mid, suffix) <= max_w) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return utf8_floor(s, lo);
+}
+
+/**
+ * Copy @p text into @p out, truncating with "..." so its width in the
+ * current font is <= @p max_w. Produces "" if not even "..." fits.
+ */
+static void fit_text(cairo_t *cr, const char *text, double max_w, char *out, size_t out_sz)
+{
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!text || max_w <= 0.0 || out_sz < sizeof(RPT_ELLIPSIS)) {
+        return;
+    }
+
+    size_t len = strlen(text);
+    if (len < out_sz && len < RPT_TEXT_BUF && text_width(cr, text) <= max_w) {
+        memcpy(out, text, len + 1);
+        return;
+    }
+    if (text_width(cr, RPT_ELLIPSIS) > max_w) {
+        return;
+    }
+
+    size_t cap = PCAPSTAT_MIN(out_sz, (size_t)RPT_TEXT_BUF) - sizeof(RPT_ELLIPSIS);
+    if (len > cap) {
+        len = utf8_floor(text, cap);
+    }
+    size_t n = fit_prefix_len(cr, text, len, RPT_ELLIPSIS, max_w);
+    while (n > 0 && (text[n - 1] == ' ' || text[n - 1] == ',')) {
+        n--;
+    }
+    memcpy(out, text, n);
+    memcpy(out + n, RPT_ELLIPSIS, sizeof(RPT_ELLIPSIS));
+}
+
+/** Draw @p text at (@p x, @p y), truncated with "..." to fit @p max_w. */
+static void show_text_fit(cairo_t *cr, double x, double y, double max_w, const char *text)
+{
+    char buf[RPT_TEXT_BUF];
+    fit_text(cr, text, max_w, buf, sizeof(buf));
+    cairo_move_to(cr, x, y);
+    cairo_show_text(cr, buf);
+}
+
+/**
+ * Draw @p text shrinking the font from @p size down to @p min_size (0.5 pt
+ * steps) until it fits @p max_w; truncates with "..." if still too wide.
+ * Leaves the font size modified (callers wrap in cairo_save/restore).
+ */
+static void show_text_shrink_fit(cairo_t *cr, double x, double y, double max_w,
+                                 double size, double min_size, const char *text)
+{
+    cairo_set_font_size(cr, size);
+    while (size - 0.5 >= min_size && text_width(cr, text) > max_w) {
+        size -= 0.5;
+        cairo_set_font_size(cr, size);
+    }
+    show_text_fit(cr, x, y, max_w, text);
+}
+
+/** Right edge budget for a column starting at @p col_x when the next starts at @p next_x. */
+static double col_w(double col_x, double next_x)
+{
+    return next_x - col_x - RPT_CELL_PAD;
+}
+
+/**
+ * @brief Word-wrap @p text into at most @p max_lines lines of width <= @p max_width.
+ *
+ * Breaks on spaces/tabs and honours '\n'. A token wider than a whole line is
+ * hard-broken at the largest fitting prefix (UTF-8 safe). If the text does
+ * not fit in @p max_lines, the last line is ended with "...".
+ *
+ * @return Number of lines written to @p lines.
  */
 static size_t wrap_text(cairo_t *cr, const char *text, double max_width,
-                        char lines[][256], size_t max_lines)
+                        char lines[][RPT_LINE_BUF], size_t max_lines)
 {
     if (!cr || !text || max_width <= 0.0 || max_lines == 0) {
         return 0;
     }
 
-    size_t line_count = 0;
-    char current[256];
-    current[0] = '\0';
+    size_t n = 0;
+    char cur[RPT_LINE_BUF];
     size_t cur_len = 0;
+    bool truncated = false;
     const char *p = text;
+    cur[0] = '\0';
 
-    while (*p && line_count < max_lines) {
-        while (*p == ' ' || *p == '\t') {
+#define WRAP_COMMIT()                                   \
+    do {                                                \
+        if (n == max_lines) {                           \
+            truncated = true;                           \
+            goto done;                                  \
+        }                                               \
+        memcpy(lines[n++], cur, cur_len + 1);           \
+        cur_len = 0;                                    \
+        cur[0] = '\0';                                  \
+    } while (0)
+
+    while (*p) {
+        if (*p == ' ' || *p == '\t') {
             p++;
+            continue;
         }
-        if (!*p) {
-            break;
-        }
-
         if (*p == '\n') {
-            if (line_count < max_lines) {
-                memcpy(lines[line_count], current, cur_len + 1);
-                line_count++;
-                current[0] = '\0';
-                cur_len = 0;
-            }
+            WRAP_COMMIT();
             p++;
             continue;
         }
 
-        char word[128];
+        const char *w = p;
         size_t wlen = 0;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && wlen < sizeof(word) - 1) {
-            word[wlen++] = *p++;
+        while (w[wlen] && w[wlen] != ' ' && w[wlen] != '\t' && w[wlen] != '\n') {
+            wlen++;
         }
-        word[wlen] = '\0';
+        p = w + wlen;
 
-        char candidate[256];
-        size_t cand_len = 0;
-        if (cur_len == 0) {
-            cand_len = wlen;
-            memcpy(candidate, word, wlen + 1);
-        } else if (cur_len + 1 + wlen < sizeof(candidate)) {
-            memcpy(candidate, current, cur_len);
-            candidate[cur_len] = ' ';
-            memcpy(candidate + cur_len + 1, word, wlen + 1);
-            cand_len = cur_len + 1 + wlen;
-        } else {
-            /* Current line full, commit and start new line with word */
-            if (line_count < max_lines) {
-                memcpy(lines[line_count], current, cur_len + 1);
-                line_count++;
+        while (wlen > 0) {
+            if (cur_len > 0) {
+                if (cur_len + 1 + wlen < RPT_LINE_BUF) {
+                    char cand[RPT_LINE_BUF];
+                    memcpy(cand, cur, cur_len);
+                    cand[cur_len] = ' ';
+                    memcpy(cand + cur_len + 1, w, wlen);
+                    cand[cur_len + 1 + wlen] = '\0';
+                    if (text_width(cr, cand) <= max_width) {
+                        memcpy(cur, cand, cur_len + 1 + wlen + 1);
+                        cur_len += 1 + wlen;
+                        break;
+                    }
+                }
+                WRAP_COMMIT();
             }
-            memcpy(current, word, wlen + 1);
-            cur_len = wlen;
-            continue;
-        }
 
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, candidate, &ext);
-
-        if (ext.width <= max_width || cur_len == 0) {
-            memcpy(current, candidate, cand_len + 1);
-            cur_len = cand_len;
-        } else {
-            if (line_count < max_lines) {
-                memcpy(lines[line_count], current, cur_len + 1);
-                line_count++;
+            /* Line is empty: place the token, hard-breaking it if too wide. */
+            size_t take = PCAPSTAT_MIN(wlen, (size_t)RPT_LINE_BUF - 1);
+            take = utf8_floor(w, take);
+            if (take == 0 || prefix_width(cr, w, take, "") > max_width) {
+                take = fit_prefix_len(cr, w, take, "", max_width);
+                if (take == 0) {
+                    /* Not even one glyph fits: emit one character anyway. */
+                    take = 1;
+                    while (take < wlen && ((unsigned char)w[take] & 0xC0) == 0x80) {
+                        take++;
+                    }
+                }
             }
-            memcpy(current, word, wlen + 1);
-            cur_len = wlen;
+            memcpy(cur, w, take);
+            cur[take] = '\0';
+            cur_len = take;
+            w += take;
+            wlen -= take;
+            if (wlen > 0) {
+                WRAP_COMMIT();
+            }
         }
     }
 
-    if (cur_len > 0 && line_count < max_lines) {
-        memcpy(lines[line_count], current, cur_len + 1);
-        line_count++;
+    if (cur_len > 0) {
+        WRAP_COMMIT();
     }
 
-    return line_count;
+done:
+#undef WRAP_COMMIT
+    if (truncated && n > 0) {
+        char tmp[RPT_LINE_BUF + sizeof(RPT_ELLIPSIS)];
+        snprintf(tmp, sizeof(tmp), "%s%s", lines[n - 1], RPT_ELLIPSIS);
+        fit_text(cr, tmp, max_width, lines[n - 1], RPT_LINE_BUF);
+    }
+    return n;
 }
 
 /* -------------------------------------------------------------------
@@ -224,15 +379,13 @@ static void draw_page_header(cairo_t *cr)
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 8.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 36.0);
-    cairo_show_text(cr, "pcapstat — Network Traffic Analysis Report");
-
     char ver_buf[64];
     snprintf(ver_buf, sizeof(ver_buf), "Version %s", PCAPSTAT_VERSION);
-    cairo_text_extents_t ext;
-    cairo_text_extents(cr, ver_buf, &ext);
-    cairo_move_to(cr, REPORT_PAGE_WIDTH - REPORT_PAGE_MARGIN - ext.width, 36.0);
+    double ver_w = text_width(cr, ver_buf);
+    cairo_move_to(cr, REPORT_PAGE_WIDTH - REPORT_PAGE_MARGIN - ver_w, 36.0);
     cairo_show_text(cr, ver_buf);
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 36.0, RPT_CONTENT_W - ver_w - 2.0 * RPT_CELL_PAD,
+                  "pcapstat - Network Traffic Analysis Report");
 
     cairo_set_source_rgb(cr, RPT_COLOR_BORDER_R, RPT_COLOR_BORDER_G, RPT_COLOR_BORDER_B);
     cairo_set_line_width(cr, 0.75);
@@ -254,15 +407,13 @@ static void draw_page_footer(cairo_t *cr, int page_num, int total_pages, const c
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 8.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 816.0);
-    cairo_show_text(cr, timestamp_str);
-
     char page_buf[64];
     snprintf(page_buf, sizeof(page_buf), "Page %d of %d", page_num, total_pages);
-    cairo_text_extents_t ext;
-    cairo_text_extents(cr, page_buf, &ext);
-    cairo_move_to(cr, REPORT_PAGE_WIDTH - REPORT_PAGE_MARGIN - ext.width, 816.0);
+    double page_w = text_width(cr, page_buf);
+    cairo_move_to(cr, REPORT_PAGE_WIDTH - REPORT_PAGE_MARGIN - page_w, 816.0);
     cairo_show_text(cr, page_buf);
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 816.0, RPT_CONTENT_W - page_w - 2.0 * RPT_CELL_PAD,
+                  timestamp_str);
     cairo_restore(cr);
 }
 
@@ -288,21 +439,18 @@ static void render_kpi_card(cairo_t *cr, double x, double y, double w, double h,
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 8.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-    cairo_move_to(cr, x + 10.0, y + 16.0);
-    cairo_show_text(cr, title);
+    double inner_w = w - 20.0;
+    show_text_fit(cr, x + 10.0, y + 16.0, inner_w, title);
 
-    /* Primary Value */
-    cairo_set_font_size(cr, 14.5);
+    /* Primary Value: shrink font before truncating so numbers stay readable */
     cairo_set_source_rgb(cr, val_r, val_g, val_b);
-    cairo_move_to(cr, x + 10.0, y + 38.0);
-    cairo_show_text(cr, val);
+    show_text_shrink_fit(cr, x + 10.0, y + 38.0, inner_w, 14.5, 9.0, val);
 
     /* Subtext */
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 8.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-    cairo_move_to(cr, x + 10.0, y + 54.0);
-    cairo_show_text(cr, subtext);
+    show_text_fit(cr, x + 10.0, y + 54.0, inner_w, subtext);
 
     cairo_restore(cr);
 }
@@ -316,14 +464,12 @@ static void render_page1_executive_summary(cairo_t *cr,
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 20.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 68.0);
-    cairo_show_text(cr, "Executive Summary & Traffic Telemetry");
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 68.0, RPT_CONTENT_W, "Executive Summary & Traffic Telemetry");
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 9.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 82.0);
-    cairo_show_text(cr, "Automated network traffic inspection, protocol metrics, and baseline security assessment");
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 82.0, RPT_CONTENT_W, "Automated network traffic inspection, protocol metrics, and baseline security assessment");
 
     /* Scope & Input Card */
     double card_x = REPORT_PAGE_MARGIN;
@@ -341,8 +487,7 @@ static void render_page1_executive_summary(cairo_t *cr,
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 9.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, card_x + 12.0, card_y + 18.0);
-    cairo_show_text(cr, "Capture Sources:");
+    show_text_fit(cr, card_x + 12.0, card_y + 18.0, 92.0, "Capture Sources:");
 
     /* Format input files string */
     char files_summary[512] = {0};
@@ -365,8 +510,7 @@ static void render_page1_executive_summary(cairo_t *cr,
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 8.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-    cairo_move_to(cr, card_x + 110.0, card_y + 18.0);
-    cairo_show_text(cr, files_summary);
+    show_text_fit(cr, card_x + 110.0, card_y + 18.0, card_w - 110.0 - 12.0, files_summary);
 
     /* Second line inside capture box */
     char meta_line[256];
@@ -377,8 +521,7 @@ static void render_page1_executive_summary(cairo_t *cr,
              (unsigned long)stats->files_processed, pkts_str, stats->duration_sec,
              stats->flows_ht ? stats->flows_ht->count : 0,
              stats->hosts_ht ? stats->hosts_ht->count : 0);
-    cairo_move_to(cr, card_x + 12.0, card_y + 36.0);
-    cairo_show_text(cr, meta_line);
+    show_text_fit(cr, card_x + 12.0, card_y + 36.0, card_w - 24.0, meta_line);
 
     /* Count anomaly severities */
     uint32_t n_crit = 0, n_warn = 0, n_info = 0;
@@ -475,8 +618,7 @@ static void render_page1_executive_summary(cairo_t *cr,
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 11.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, card_x, tbl_y);
-    cairo_show_text(cr, "Global Protocol & Wire Volume Breakdown");
+    show_text_fit(cr, card_x, tbl_y, RPT_CONTENT_W, "Global Protocol & Wire Volume Breakdown");
 
     tbl_y += 10.0;
     /* Header Row */
@@ -491,16 +633,11 @@ static void render_page1_executive_summary(cairo_t *cr,
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 8.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, card_x + 8.0, tbl_y + 12.5);
-    cairo_show_text(cr, "Traffic Category");
-    cairo_move_to(cr, card_x + 160.0, tbl_y + 12.5);
-    cairo_show_text(cr, "Packets");
-    cairo_move_to(cr, card_x + 245.0, tbl_y + 12.5);
-    cairo_show_text(cr, "Packet Share");
-    cairo_move_to(cr, card_x + 335.0, tbl_y + 12.5);
-    cairo_show_text(cr, "Volume (Bytes)");
-    cairo_move_to(cr, card_x + 440.0, tbl_y + 12.5);
-    cairo_show_text(cr, "Volume Share");
+    show_text_fit(cr, card_x + 8.0, tbl_y + 12.5, col_w(8.0, 160.0), "Traffic Category");
+    show_text_fit(cr, card_x + 160.0, tbl_y + 12.5, col_w(160.0, 245.0), "Packets");
+    show_text_fit(cr, card_x + 245.0, tbl_y + 12.5, col_w(245.0, 335.0), "Packet Share");
+    show_text_fit(cr, card_x + 335.0, tbl_y + 12.5, col_w(335.0, 440.0), "Volume (Bytes)");
+    show_text_fit(cr, card_x + 440.0, tbl_y + 12.5, col_w(440.0, card_w), "Volume Share");
 
     struct {
         const char *label;
@@ -536,8 +673,7 @@ static void render_page1_executive_summary(cairo_t *cr,
         cairo_set_font_size(cr, 8.5);
         cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
-        cairo_move_to(cr, card_x + 8.0, cur_y + 11.5);
-        cairo_show_text(cr, proto_rows[i].label);
+        show_text_fit(cr, card_x + 8.0, cur_y + 11.5, col_w(8.0, 160.0), proto_rows[i].label);
 
         char p_str[32], b_str[32], ps_str[32], bs_str[32];
         format_count_commas(proto_rows[i].pkts, p_str, sizeof(p_str));
@@ -553,14 +689,10 @@ static void render_page1_executive_summary(cairo_t *cr,
             snprintf(bs_str, sizeof(bs_str), "N/A");
         }
 
-        cairo_move_to(cr, card_x + 160.0, cur_y + 11.5);
-        cairo_show_text(cr, p_str);
-        cairo_move_to(cr, card_x + 245.0, cur_y + 11.5);
-        cairo_show_text(cr, ps_str);
-        cairo_move_to(cr, card_x + 335.0, cur_y + 11.5);
-        cairo_show_text(cr, b_str);
-        cairo_move_to(cr, card_x + 440.0, cur_y + 11.5);
-        cairo_show_text(cr, bs_str);
+        show_text_fit(cr, card_x + 160.0, cur_y + 11.5, col_w(160.0, 245.0), p_str);
+        show_text_fit(cr, card_x + 245.0, cur_y + 11.5, col_w(245.0, 335.0), ps_str);
+        show_text_fit(cr, card_x + 335.0, cur_y + 11.5, col_w(335.0, 440.0), b_str);
+        show_text_fit(cr, card_x + 440.0, cur_y + 11.5, col_w(440.0, card_w), bs_str);
 
         cur_y += (i == 4) ? 17.0 : 16.0;
     }
@@ -572,8 +704,7 @@ static void render_page1_executive_summary(cairo_t *cr,
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 11.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, card_x, flag_y);
-    cairo_show_text(cr, "TCP Flags Telemetry & Connection Behavior");
+    show_text_fit(cr, card_x, flag_y, RPT_CONTENT_W, "TCP Flags Telemetry & Connection Behavior");
 
     flag_y += 10.0;
     cairo_set_source_rgb(cr, RPT_COLOR_TH_BG_R, RPT_COLOR_TH_BG_G, RPT_COLOR_TH_BG_B);
@@ -587,14 +718,10 @@ static void render_page1_executive_summary(cairo_t *cr,
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 8.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, card_x + 8.0, flag_y + 12.5);
-    cairo_show_text(cr, "TCP Flag / Condition");
-    cairo_move_to(cr, card_x + 160.0, flag_y + 12.5);
-    cairo_show_text(cr, "Occurrences");
-    cairo_move_to(cr, card_x + 245.0, flag_y + 12.5);
-    cairo_show_text(cr, "% of TCP Traffic");
-    cairo_move_to(cr, card_x + 335.0, flag_y + 12.5);
-    cairo_show_text(cr, "Health & Diagnostic Signal");
+    show_text_fit(cr, card_x + 8.0, flag_y + 12.5, col_w(8.0, 140.0), "TCP Flag / Condition");
+    show_text_fit(cr, card_x + 140.0, flag_y + 12.5, col_w(140.0, 205.0), "Count");
+    show_text_fit(cr, card_x + 205.0, flag_y + 12.5, col_w(205.0, 280.0), "% of TCP");
+    show_text_fit(cr, card_x + 280.0, flag_y + 12.5, col_w(280.0, card_w), "Health & Diagnostic Signal");
 
     struct {
         const char *flag;
@@ -631,18 +758,15 @@ static void render_page1_executive_summary(cairo_t *cr,
         cairo_set_font_size(cr, 8.0);
         cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
-        cairo_move_to(cr, card_x + 8.0, cur_y + 11.0);
-        cairo_show_text(cr, flags[i].flag);
+        show_text_fit(cr, card_x + 8.0, cur_y + 11.0, col_w(8.0, 140.0), flags[i].flag);
 
         char c_str[32], s_str[32];
         format_count_commas(flags[i].count, c_str, sizeof(c_str));
         double tcp_share = stats->tcp_packets ? (100.0 * (double)flags[i].count / (double)stats->tcp_packets) : 0.0;
         snprintf(s_str, sizeof(s_str), "%.1f %%", tcp_share);
 
-        cairo_move_to(cr, card_x + 160.0, cur_y + 11.0);
-        cairo_show_text(cr, c_str);
-        cairo_move_to(cr, card_x + 245.0, cur_y + 11.0);
-        cairo_show_text(cr, s_str);
+        show_text_fit(cr, card_x + 140.0, cur_y + 11.0, col_w(140.0, 205.0), c_str);
+        show_text_fit(cr, card_x + 205.0, cur_y + 11.0, col_w(205.0, 280.0), s_str);
 
         if (i == 7 && flags[i].count > 0) {
             cairo_set_source_rgb(cr, RPT_COLOR_CRIT_R, RPT_COLOR_CRIT_G, RPT_COLOR_CRIT_B);
@@ -651,8 +775,7 @@ static void render_page1_executive_summary(cairo_t *cr,
         } else {
             cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
         }
-        cairo_move_to(cr, card_x + 335.0, cur_y + 11.0);
-        cairo_show_text(cr, flags[i].diag);
+        show_text_fit(cr, card_x + 280.0, cur_y + 11.0, col_w(280.0, card_w), flags[i].diag);
 
         cur_y += 15.0;
     }
@@ -668,14 +791,12 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 18.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 68.0);
-    cairo_show_text(cr, "Traffic Characteristics & Top Rankings");
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 68.0, RPT_CONTENT_W, "Traffic Characteristics & Top Rankings");
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 9.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 82.0);
-    cairo_show_text(cr, "Detailed top-10 rankings for endpoints, destination services, and active network flows");
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 82.0, RPT_CONTENT_W, "Detailed top-10 rankings for endpoints, destination services, and active network flows");
 
     double card_x = REPORT_PAGE_MARGIN;
     double card_w = REPORT_PAGE_WIDTH - 2.0 * REPORT_PAGE_MARGIN;
@@ -683,12 +804,11 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
     /* ---------------------------------------------------------------
      * Table 1: Top 10 IP Talkers (Hosts)
      * --------------------------------------------------------------- */
-    double tbl1_y = 96.0;
+    double tbl1_y = 104.0;
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 10.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, card_x, tbl1_y);
-    cairo_show_text(cr, "1. Top 10 IP Talkers (by Total Wire Volume)");
+    show_text_fit(cr, card_x, tbl1_y, RPT_CONTENT_W, "1. Top 10 IP Talkers (by Total Wire Volume)");
 
     tbl1_y += 6.0;
     cairo_set_source_rgb(cr, RPT_COLOR_TH_BG_R, RPT_COLOR_TH_BG_G, RPT_COLOR_TH_BG_B);
@@ -703,20 +823,13 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
     cairo_set_font_size(cr, 8.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
-    cairo_move_to(cr, card_x + 6.0, tbl1_y + 11.5);
-    cairo_show_text(cr, "#");
-    cairo_move_to(cr, card_x + 30.0, tbl1_y + 11.5);
-    cairo_show_text(cr, "IP Address");
-    cairo_move_to(cr, card_x + 175.0, tbl1_y + 11.5);
-    cairo_show_text(cr, "TX Pkts");
-    cairo_move_to(cr, card_x + 245.0, tbl1_y + 11.5);
-    cairo_show_text(cr, "TX Volume");
-    cairo_move_to(cr, card_x + 325.0, tbl1_y + 11.5);
-    cairo_show_text(cr, "RX Pkts");
-    cairo_move_to(cr, card_x + 395.0, tbl1_y + 11.5);
-    cairo_show_text(cr, "RX Volume");
-    cairo_move_to(cr, card_x + 465.0, tbl1_y + 11.5);
-    cairo_show_text(cr, "Total Wire Vol");
+    show_text_fit(cr, card_x + 6.0, tbl1_y + 11.5, col_w(6.0, 24.0), "#");
+    show_text_fit(cr, card_x + 24.0, tbl1_y + 11.5, col_w(24.0, 175.0), "IP Address");
+    show_text_fit(cr, card_x + 175.0, tbl1_y + 11.5, col_w(175.0, 235.0), "TX Pkts");
+    show_text_fit(cr, card_x + 235.0, tbl1_y + 11.5, col_w(235.0, 300.0), "TX Volume");
+    show_text_fit(cr, card_x + 300.0, tbl1_y + 11.5, col_w(300.0, 360.0), "RX Pkts");
+    show_text_fit(cr, card_x + 360.0, tbl1_y + 11.5, col_w(360.0, 425.0), "RX Volume");
+    show_text_fit(cr, card_x + 425.0, tbl1_y + 11.5, col_w(425.0, card_w), "Total Volume");
 
     const host_stats_t *hosts[10];
     size_t host_n = stats_top_hosts(stats, hosts, 10);
@@ -751,27 +864,19 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
             cairo_set_font_size(cr, 8.0);
             cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
-            cairo_move_to(cr, card_x + 6.0, cur_y + 10.5);
-            cairo_show_text(cr, rank_str);
-            cairo_move_to(cr, card_x + 30.0, cur_y + 10.5);
-            cairo_show_text(cr, ip_str);
-            cairo_move_to(cr, card_x + 175.0, cur_y + 10.5);
-            cairo_show_text(cr, tx_p);
-            cairo_move_to(cr, card_x + 245.0, cur_y + 10.5);
-            cairo_show_text(cr, tx_b);
-            cairo_move_to(cr, card_x + 325.0, cur_y + 10.5);
-            cairo_show_text(cr, rx_p);
-            cairo_move_to(cr, card_x + 395.0, cur_y + 10.5);
-            cairo_show_text(cr, rx_b);
+            show_text_fit(cr, card_x + 6.0, cur_y + 10.5, col_w(6.0, 24.0), rank_str);
+            show_text_fit(cr, card_x + 24.0, cur_y + 10.5, col_w(24.0, 175.0), ip_str);
+            show_text_fit(cr, card_x + 175.0, cur_y + 10.5, col_w(175.0, 235.0), tx_p);
+            show_text_fit(cr, card_x + 235.0, cur_y + 10.5, col_w(235.0, 300.0), tx_b);
+            show_text_fit(cr, card_x + 300.0, cur_y + 10.5, col_w(300.0, 360.0), rx_p);
+            show_text_fit(cr, card_x + 360.0, cur_y + 10.5, col_w(360.0, 425.0), rx_b);
             cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-            cairo_move_to(cr, card_x + 465.0, cur_y + 10.5);
-            cairo_show_text(cr, tot_b);
+            show_text_fit(cr, card_x + 425.0, cur_y + 10.5, col_w(425.0, card_w), tot_b);
         } else {
             cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
             cairo_set_font_size(cr, 7.5);
             cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-            cairo_move_to(cr, card_x + 30.0, cur_y + 10.5);
-            cairo_show_text(cr, "-");
+            show_text_fit(cr, card_x + 24.0, cur_y + 10.5, col_w(24.0, 175.0), "-");
         }
         cur_y += 14.0;
     }
@@ -783,8 +888,7 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 10.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, card_x, tbl2_y);
-    cairo_show_text(cr, "2. Top 10 Destination Ports & Services (by Packet Count)");
+    show_text_fit(cr, card_x, tbl2_y, RPT_CONTENT_W, "2. Top 10 Destination Ports & Services (by Packet Count)");
 
     tbl2_y += 6.0;
     cairo_set_source_rgb(cr, RPT_COLOR_TH_BG_R, RPT_COLOR_TH_BG_G, RPT_COLOR_TH_BG_B);
@@ -799,20 +903,13 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
     cairo_set_font_size(cr, 8.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
-    cairo_move_to(cr, card_x + 6.0, tbl2_y + 11.5);
-    cairo_show_text(cr, "#");
-    cairo_move_to(cr, card_x + 30.0, tbl2_y + 11.5);
-    cairo_show_text(cr, "Proto");
-    cairo_move_to(cr, card_x + 75.0, tbl2_y + 11.5);
-    cairo_show_text(cr, "Port");
-    cairo_move_to(cr, card_x + 130.0, tbl2_y + 11.5);
-    cairo_show_text(cr, "Service Name");
-    cairo_move_to(cr, card_x + 245.0, tbl2_y + 11.5);
-    cairo_show_text(cr, "Packets");
-    cairo_move_to(cr, card_x + 345.0, tbl2_y + 11.5);
-    cairo_show_text(cr, "Wire Volume");
-    cairo_move_to(cr, card_x + 445.0, tbl2_y + 11.5);
-    cairo_show_text(cr, "% of Total Packets");
+    show_text_fit(cr, card_x + 6.0, tbl2_y + 11.5, col_w(6.0, 30.0), "#");
+    show_text_fit(cr, card_x + 30.0, tbl2_y + 11.5, col_w(30.0, 75.0), "Proto");
+    show_text_fit(cr, card_x + 75.0, tbl2_y + 11.5, col_w(75.0, 130.0), "Port");
+    show_text_fit(cr, card_x + 130.0, tbl2_y + 11.5, col_w(130.0, 245.0), "Service Name");
+    show_text_fit(cr, card_x + 245.0, tbl2_y + 11.5, col_w(245.0, 345.0), "Packets");
+    show_text_fit(cr, card_x + 345.0, tbl2_y + 11.5, col_w(345.0, 445.0), "Wire Volume");
+    show_text_fit(cr, card_x + 445.0, tbl2_y + 11.5, col_w(445.0, card_w), "% of Packets");
 
     const port_stats_t *ports[10];
     size_t port_n = stats_top_ports(stats, ports, 10);
@@ -847,26 +944,18 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
             cairo_set_font_size(cr, 8.0);
             cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
-            cairo_move_to(cr, card_x + 6.0, cur_y + 10.5);
-            cairo_show_text(cr, rank_str);
-            cairo_move_to(cr, card_x + 30.0, cur_y + 10.5);
-            cairo_show_text(cr, proto_name);
-            cairo_move_to(cr, card_x + 75.0, cur_y + 10.5);
-            cairo_show_text(cr, port_str);
-            cairo_move_to(cr, card_x + 130.0, cur_y + 10.5);
-            cairo_show_text(cr, svc_name);
-            cairo_move_to(cr, card_x + 245.0, cur_y + 10.5);
-            cairo_show_text(cr, p_str);
-            cairo_move_to(cr, card_x + 345.0, cur_y + 10.5);
-            cairo_show_text(cr, b_str);
-            cairo_move_to(cr, card_x + 445.0, cur_y + 10.5);
-            cairo_show_text(cr, share_str);
+            show_text_fit(cr, card_x + 6.0, cur_y + 10.5, col_w(6.0, 30.0), rank_str);
+            show_text_fit(cr, card_x + 30.0, cur_y + 10.5, col_w(30.0, 75.0), proto_name);
+            show_text_fit(cr, card_x + 75.0, cur_y + 10.5, col_w(75.0, 130.0), port_str);
+            show_text_fit(cr, card_x + 130.0, cur_y + 10.5, col_w(130.0, 245.0), svc_name);
+            show_text_fit(cr, card_x + 245.0, cur_y + 10.5, col_w(245.0, 345.0), p_str);
+            show_text_fit(cr, card_x + 345.0, cur_y + 10.5, col_w(345.0, 445.0), b_str);
+            show_text_fit(cr, card_x + 445.0, cur_y + 10.5, col_w(445.0, card_w), share_str);
         } else {
             cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
             cairo_set_font_size(cr, 7.5);
             cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-            cairo_move_to(cr, card_x + 30.0, cur_y + 10.5);
-            cairo_show_text(cr, "-");
+            show_text_fit(cr, card_x + 30.0, cur_y + 10.5, col_w(30.0, 75.0), "-");
         }
         cur_y += 14.0;
     }
@@ -878,8 +967,7 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 10.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, card_x, tbl3_y);
-    cairo_show_text(cr, "3. Top 10 Directional 5-Tuple Network Flows");
+    show_text_fit(cr, card_x, tbl3_y, RPT_CONTENT_W, "3. Top 10 Directional 5-Tuple Network Flows");
 
     tbl3_y += 6.0;
     cairo_set_source_rgb(cr, RPT_COLOR_TH_BG_R, RPT_COLOR_TH_BG_G, RPT_COLOR_TH_BG_B);
@@ -894,20 +982,13 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
     cairo_set_font_size(cr, 8.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
-    cairo_move_to(cr, card_x + 6.0, tbl3_y + 11.5);
-    cairo_show_text(cr, "#");
-    cairo_move_to(cr, card_x + 26.0, tbl3_y + 11.5);
-    cairo_show_text(cr, "Proto");
-    cairo_move_to(cr, card_x + 62.0, tbl3_y + 11.5);
-    cairo_show_text(cr, "Flow 5-Tuple (Source:Port -> Destination:Port)");
-    cairo_move_to(cr, card_x + 305.0, tbl3_y + 11.5);
-    cairo_show_text(cr, "Packets");
-    cairo_move_to(cr, card_x + 365.0, tbl3_y + 11.5);
-    cairo_show_text(cr, "Volume");
-    cairo_move_to(cr, card_x + 425.0, tbl3_y + 11.5);
-    cairo_show_text(cr, "Retrans");
-    cairo_move_to(cr, card_x + 475.0, tbl3_y + 11.5);
-    cairo_show_text(cr, "Duration");
+    show_text_fit(cr, card_x + 6.0, tbl3_y + 11.5, col_w(6.0, 22.0), "#");
+    show_text_fit(cr, card_x + 22.0, tbl3_y + 11.5, col_w(22.0, 56.0), "Proto");
+    show_text_fit(cr, card_x + 56.0, tbl3_y + 11.5, col_w(56.0, 300.0), "Flow 5-Tuple (Source:Port -> Destination:Port)");
+    show_text_fit(cr, card_x + 300.0, tbl3_y + 11.5, col_w(300.0, 352.0), "Packets");
+    show_text_fit(cr, card_x + 352.0, tbl3_y + 11.5, col_w(352.0, 408.0), "Volume");
+    show_text_fit(cr, card_x + 408.0, tbl3_y + 11.5, col_w(408.0, 452.0), "Retrans");
+    show_text_fit(cr, card_x + 452.0, tbl3_y + 11.5, col_w(452.0, card_w), "Duration");
 
     const flow_stats_t *flows[10];
     size_t flow_n = stats_top_flows(stats, flows, 10);
@@ -950,32 +1031,24 @@ static void render_page2_traffic_characteristics(cairo_t *cr, const stats_ctx_t 
             cairo_set_font_size(cr, 7.5);
             cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
-            cairo_move_to(cr, card_x + 6.0, cur_y + 10.5);
-            cairo_show_text(cr, rank_str);
-            cairo_move_to(cr, card_x + 26.0, cur_y + 10.5);
-            cairo_show_text(cr, proto_name);
-            cairo_move_to(cr, card_x + 62.0, cur_y + 10.5);
-            cairo_show_text(cr, tuple_str);
-            cairo_move_to(cr, card_x + 305.0, cur_y + 10.5);
-            cairo_show_text(cr, p_str);
-            cairo_move_to(cr, card_x + 365.0, cur_y + 10.5);
-            cairo_show_text(cr, b_str);
+            show_text_fit(cr, card_x + 6.0, cur_y + 10.5, col_w(6.0, 22.0), rank_str);
+            show_text_fit(cr, card_x + 22.0, cur_y + 10.5, col_w(22.0, 56.0), proto_name);
+            show_text_fit(cr, card_x + 56.0, cur_y + 10.5, col_w(56.0, 300.0), tuple_str);
+            show_text_fit(cr, card_x + 300.0, cur_y + 10.5, col_w(300.0, 352.0), p_str);
+            show_text_fit(cr, card_x + 352.0, cur_y + 10.5, col_w(352.0, 408.0), b_str);
 
             if (f->retransmissions > 0) {
                 cairo_set_source_rgb(cr, RPT_COLOR_WARN_R, RPT_COLOR_WARN_G, RPT_COLOR_WARN_B);
             }
-            cairo_move_to(cr, card_x + 425.0, cur_y + 10.5);
-            cairo_show_text(cr, r_str);
+            show_text_fit(cr, card_x + 408.0, cur_y + 10.5, col_w(408.0, 452.0), r_str);
 
             cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-            cairo_move_to(cr, card_x + 475.0, cur_y + 10.5);
-            cairo_show_text(cr, dur_str);
+            show_text_fit(cr, card_x + 452.0, cur_y + 10.5, col_w(452.0, card_w), dur_str);
         } else {
             cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
             cairo_set_font_size(cr, 7.5);
             cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-            cairo_move_to(cr, card_x + 30.0, cur_y + 10.5);
-            cairo_show_text(cr, "-");
+            show_text_fit(cr, card_x + 56.0, cur_y + 10.5, col_w(56.0, 300.0), "-");
         }
         cur_y += 14.0;
     }
@@ -991,14 +1064,12 @@ static int render_page3_visualizations(cairo_t *cr, const stats_ctx_t *stats)
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 18.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 68.0);
-    cairo_show_text(cr, "Visualizations & Traffic Patterns");
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 68.0, RPT_CONTENT_W, "Visualizations & Traffic Patterns");
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 9.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 82.0);
-    cairo_show_text(cr, "Embedded vector charts rendered directly into the PDF coordinate system");
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 82.0, RPT_CONTENT_W, "Embedded vector charts rendered directly into the PDF coordinate system");
 
     /* 2x2 Grid Layout Calculations */
     double total_w = REPORT_PAGE_WIDTH - 2.0 * REPORT_PAGE_MARGIN;
@@ -1036,6 +1107,34 @@ static int render_page3_visualizations(cairo_t *cr, const stats_ctx_t *stats)
  * Page 4+: Detected Anomalies with Pagination
  * ------------------------------------------------------------------- */
 
+/* Anomaly table layout, shared by page counting and rendering so the
+ * pre-computed "Page X of Y" always matches the pages actually emitted. */
+#define ANOM_COL_SEV_X        8.0
+#define ANOM_COL_CAT_X        85.0
+#define ANOM_COL_DESC_X       225.0
+#define ANOM_DESC_W           (RPT_CONTENT_W - ANOM_COL_DESC_X - 8.0)
+#define ANOM_DESC_FONT        8.0
+#define ANOM_DESC_MAX_LINES   16
+#define ANOM_LINE_H           12.0
+#define ANOM_HEADER_H         18.0
+#define ANOM_FIRST_TABLE_Y    96.0
+#define ANOM_CONT_TABLE_Y     60.0
+#define ANOM_MAX_Y            785.0
+
+/** Wrap @p a's description into @p lines and return the row height. */
+static double anomaly_row_layout(cairo_t *cr, const anomaly_t *a,
+                                 char lines[][RPT_LINE_BUF], size_t *nlines)
+{
+    cairo_save(cr);
+    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, ANOM_DESC_FONT);
+    *nlines = wrap_text(cr, a->description, ANOM_DESC_W, lines, ANOM_DESC_MAX_LINES);
+    cairo_restore(cr);
+
+    double row_h = (double)(*nlines > 2 ? *nlines : 2) * ANOM_LINE_H + 10.0;
+    return (row_h < 30.0) ? 30.0 : row_h;
+}
+
 static int calculate_total_pages(cairo_t *cr, const anomaly_list_t *anomalies)
 {
     if (!anomalies || anomalies->count == 0) {
@@ -1043,30 +1142,18 @@ static int calculate_total_pages(cairo_t *cr, const anomaly_list_t *anomalies)
     }
 
     int anomaly_pages = 1;
-    double cur_y = 114.0;
-    const double max_y = 785.0;
+    double cur_y = ANOM_FIRST_TABLE_Y + ANOM_HEADER_H;
 
     for (size_t i = 0; i < anomalies->count; i++) {
-        const anomaly_t *a = &anomalies->items[i];
-        char desc_lines[16][256];
+        char desc_lines[ANOM_DESC_MAX_LINES][RPT_LINE_BUF];
+        size_t nlines;
+        double row_h = anomaly_row_layout(cr, &anomalies->items[i], desc_lines, &nlines);
 
-        cairo_save(cr);
-        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 8.5);
-        size_t nlines = wrap_text(cr, a->description, 290.0, desc_lines, 16);
-        cairo_restore(cr);
-
-        double row_h = (nlines > 2 ? nlines : 2) * 12.0 + 10.0;
-        if (row_h < 30.0) {
-            row_h = 30.0;
-        }
-
-        if (cur_y + row_h > max_y) {
+        if (cur_y + row_h > ANOM_MAX_Y) {
             anomaly_pages++;
-            cur_y = 80.0 + row_h;
-        } else {
-            cur_y += row_h;
+            cur_y = ANOM_CONT_TABLE_Y + ANOM_HEADER_H;
         }
+        cur_y += row_h;
     }
 
     return 3 + anomaly_pages;
@@ -1075,26 +1162,26 @@ static int calculate_total_pages(cairo_t *cr, const anomaly_list_t *anomalies)
 static void draw_anomaly_table_header(cairo_t *cr, double y)
 {
     double card_x = REPORT_PAGE_MARGIN;
-    double card_w = REPORT_PAGE_WIDTH - 2.0 * REPORT_PAGE_MARGIN;
+    double card_w = RPT_CONTENT_W;
 
     cairo_set_source_rgb(cr, RPT_COLOR_TH_BG_R, RPT_COLOR_TH_BG_G, RPT_COLOR_TH_BG_B);
-    cairo_rectangle(cr, card_x, y, card_w, 18.0);
+    cairo_rectangle(cr, card_x, y, card_w, ANOM_HEADER_H);
     cairo_fill(cr);
     cairo_set_source_rgb(cr, RPT_COLOR_BORDER_R, RPT_COLOR_BORDER_G, RPT_COLOR_BORDER_B);
     cairo_set_line_width(cr, 0.5);
-    cairo_rectangle(cr, card_x, y, card_w, 18.0);
+    cairo_rectangle(cr, card_x, y, card_w, ANOM_HEADER_H);
     cairo_stroke(cr);
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 8.5);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
-    cairo_move_to(cr, card_x + 8.0, y + 12.5);
-    cairo_show_text(cr, "Severity");
-    cairo_move_to(cr, card_x + 85.0, y + 12.5);
-    cairo_show_text(cr, "Category & Subject");
-    cairo_move_to(cr, card_x + 225.0, y + 12.5);
-    cairo_show_text(cr, "Finding Details & Metric Analysis");
+    show_text_fit(cr, card_x + ANOM_COL_SEV_X, y + 12.5,
+                  col_w(ANOM_COL_SEV_X, ANOM_COL_CAT_X), "Severity");
+    show_text_fit(cr, card_x + ANOM_COL_CAT_X, y + 12.5,
+                  col_w(ANOM_COL_CAT_X, ANOM_COL_DESC_X), "Category & Subject");
+    show_text_fit(cr, card_x + ANOM_COL_DESC_X, y + 12.5, ANOM_DESC_W,
+                  "Finding Details & Metric Analysis");
 }
 
 static void render_page4_anomalies(cairo_t *cr,
@@ -1105,7 +1192,7 @@ static void render_page4_anomalies(cairo_t *cr,
 {
     int current_page = start_page;
     double card_x = REPORT_PAGE_MARGIN;
-    double card_w = REPORT_PAGE_WIDTH - 2.0 * REPORT_PAGE_MARGIN;
+    double card_w = RPT_CONTENT_W;
 
     /* Header for first anomaly page */
     draw_page_header(cr);
@@ -1113,20 +1200,19 @@ static void render_page4_anomalies(cairo_t *cr,
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
     cairo_set_font_size(cr, 18.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 68.0);
-    cairo_show_text(cr, "Detected Network Anomalies");
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 68.0, RPT_CONTENT_W, "Detected Network Anomalies");
 
     cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 9.0);
     cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-    cairo_move_to(cr, REPORT_PAGE_MARGIN, 82.0);
-
     if (!anomalies || anomalies->count == 0) {
-        cairo_show_text(cr, "Rule-based heuristic evaluation findings and baseline compliance");
+        show_text_fit(cr, REPORT_PAGE_MARGIN, 82.0, RPT_CONTENT_W,
+                      "Rule-based heuristic evaluation findings and baseline compliance");
 
         /* Clean "No Anomalies" card */
         double box_y = 110.0;
         double box_h = 70.0;
+        double inner_w = card_w - 32.0;
         draw_rounded_rect(cr, card_x, box_y, card_w, box_h, 4.0);
         cairo_set_source_rgb(cr, 0.94, 0.99, 0.95);
         cairo_fill_preserve(cr);
@@ -1137,14 +1223,20 @@ static void render_page4_anomalies(cairo_t *cr,
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
         cairo_set_font_size(cr, 12.0);
         cairo_set_source_rgb(cr, RPT_COLOR_OK_R, RPT_COLOR_OK_G, RPT_COLOR_OK_B);
-        cairo_move_to(cr, card_x + 16.0, box_y + 26.0);
-        cairo_show_text(cr, "No Network Anomalies Detected");
+        show_text_fit(cr, card_x + 16.0, box_y + 26.0, inner_w, "No Network Anomalies Detected");
 
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 9.0);
         cairo_set_source_rgb(cr, 0.08, 0.40, 0.20);
-        cairo_move_to(cr, card_x + 16.0, box_y + 44.0);
-        cairo_show_text(cr, "All analyzed traffic patterns, TCP flags, port distributions, and flow behaviors conform to configured baseline thresholds.");
+        char ok_lines[2][RPT_LINE_BUF];
+        size_t ok_n = wrap_text(cr,
+                                "All analyzed traffic patterns, TCP flags, port distributions, "
+                                "and flow behaviors conform to configured baseline thresholds.",
+                                inner_w, ok_lines, 2);
+        for (size_t j = 0; j < ok_n; j++) {
+            cairo_move_to(cr, card_x + 16.0, box_y + 44.0 + 12.0 * (double)j);
+            cairo_show_text(cr, ok_lines[j]);
+        }
 
         draw_page_footer(cr, current_page, total_pages, ts_str);
         cairo_show_page(cr);
@@ -1155,40 +1247,29 @@ static void render_page4_anomalies(cairo_t *cr,
     snprintf(subhead, sizeof(subhead),
              "%zu anomaly findings detected and ordered by severity descending",
              anomalies->count);
-    cairo_show_text(cr, subhead);
+    show_text_fit(cr, REPORT_PAGE_MARGIN, 82.0, RPT_CONTENT_W, subhead);
 
-    double cur_y = 96.0;
+    double cur_y = ANOM_FIRST_TABLE_Y;
     draw_anomaly_table_header(cr, cur_y);
-    cur_y += 18.0;
-
-    const double max_page_y = 785.0;
+    cur_y += ANOM_HEADER_H;
 
     for (size_t i = 0; i < anomalies->count; i++) {
         const anomaly_t *a = &anomalies->items[i];
 
-        /* Word-wrap description */
-        char desc_lines[16][256];
-        cairo_save(cr);
-        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 8.5);
-        size_t nlines = wrap_text(cr, a->description, 285.0, desc_lines, 16);
-        cairo_restore(cr);
-
-        double row_h = (nlines > 2 ? nlines : 2) * 12.0 + 10.0;
-        if (row_h < 30.0) {
-            row_h = 30.0;
-        }
+        char desc_lines[ANOM_DESC_MAX_LINES][RPT_LINE_BUF];
+        size_t nlines;
+        double row_h = anomaly_row_layout(cr, a, desc_lines, &nlines);
 
         /* Check for page overflow */
-        if (cur_y + row_h > max_page_y) {
+        if (cur_y + row_h > ANOM_MAX_Y) {
             draw_page_footer(cr, current_page, total_pages, ts_str);
             cairo_show_page(cr);
             current_page++;
 
             draw_page_header(cr);
-            cur_y = 60.0;
+            cur_y = ANOM_CONT_TABLE_Y;
             draw_anomaly_table_header(cr, cur_y);
-            cur_y += 18.0;
+            cur_y += ANOM_HEADER_H;
         }
 
         /* Zebra background */
@@ -1208,7 +1289,7 @@ static void render_page4_anomalies(cairo_t *cr,
         /* Severity Badge */
         double badge_w = 64.0;
         double badge_h = 16.0;
-        double badge_x = card_x + 8.0;
+        double badge_x = card_x + ANOM_COL_SEV_X;
         double badge_y = cur_y + (row_h - badge_h) / 2.0;
 
         draw_rounded_rect(cr, badge_x, badge_y, badge_w, badge_h, 3.0);
@@ -1225,34 +1306,35 @@ static void render_page4_anomalies(cairo_t *cr,
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
         cairo_set_font_size(cr, 7.5);
         cairo_set_source_rgb(cr, RPT_COLOR_WHITE_R, RPT_COLOR_WHITE_G, RPT_COLOR_WHITE_B);
+        char sev_fit[RPT_TEXT_BUF];
+        fit_text(cr, sev_text, badge_w - 8.0, sev_fit, sizeof(sev_fit));
         cairo_text_extents_t sext;
-        cairo_text_extents(cr, sev_text, &sext);
-        cairo_move_to(cr, badge_x + (badge_w - sext.width) / 2.0, badge_y + 11.5);
-        cairo_show_text(cr, sev_text);
+        cairo_text_extents(cr, sev_fit, &sext);
+        cairo_move_to(cr, badge_x + (badge_w - sext.width) / 2.0 - sext.x_bearing, badge_y + 11.5);
+        cairo_show_text(cr, sev_fit);
 
-        /* Category & Subject */
+        /* Category & Subject (single line each, truncated to column) */
+        double cat_w = col_w(ANOM_COL_CAT_X, ANOM_COL_DESC_X);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
         cairo_set_font_size(cr, 8.5);
         cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
-        cairo_move_to(cr, card_x + 85.0, cur_y + 12.0);
-        cairo_show_text(cr, a->category);
+        show_text_fit(cr, card_x + ANOM_COL_CAT_X, cur_y + 12.0, cat_w, a->category);
 
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 7.5);
         cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MUTED_R, RPT_COLOR_TEXT_MUTED_G, RPT_COLOR_TEXT_MUTED_B);
-        cairo_move_to(cr, card_x + 85.0, cur_y + 23.0);
-        cairo_show_text(cr, a->subject);
+        show_text_fit(cr, card_x + ANOM_COL_CAT_X, cur_y + 23.0, cat_w, a->subject);
 
-        /* Description Lines */
+        /* Description Lines (same font as measured in anomaly_row_layout) */
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, 8.0);
+        cairo_set_font_size(cr, ANOM_DESC_FONT);
         cairo_set_source_rgb(cr, RPT_COLOR_TEXT_MAIN_R, RPT_COLOR_TEXT_MAIN_G, RPT_COLOR_TEXT_MAIN_B);
 
         double line_y = cur_y + 11.0;
         for (size_t j = 0; j < nlines; j++) {
-            cairo_move_to(cr, card_x + 225.0, line_y);
+            cairo_move_to(cr, card_x + ANOM_COL_DESC_X, line_y);
             cairo_show_text(cr, desc_lines[j]);
-            line_y += 12.0;
+            line_y += ANOM_LINE_H;
         }
 
         cur_y += row_h;

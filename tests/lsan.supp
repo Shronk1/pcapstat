@@ -1,0 +1,6 @@
+# LeakSanitizer suppressions for pcapstat.
+# fontconfig (loaded by cairo's toy font API) keeps a process-wide config
+# cache parsed from its XML files; cairo_debug_reset_static_data() cannot
+# release it and FcFini() would require linking -lfontconfig directly.
+# Scope: only stacks that pass through libfontconfig.
+leak:libfontconfig

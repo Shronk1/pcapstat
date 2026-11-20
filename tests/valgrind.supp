@@ -1,0 +1,13 @@
+# Valgrind suppressions for pcapstat.
+# fontconfig (loaded by cairo's toy font API) keeps a process-wide config
+# cache built while parsing its XML config via libexpat; some of it is not
+# reachable at exit. Scope: the allocator's *immediate* caller must be code
+# inside libfontconfig, so allocations made by project code never match.
+# Derived from `valgrind --gen-suppressions=all` (fontconfig 2.x / expat).
+{
+   fontconfig-config-cache
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible,reachable
+   fun:*alloc
+   obj:*/libfontconfig.so*
+}

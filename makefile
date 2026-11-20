@@ -71,6 +71,7 @@ asan: $(BINDIR)/pcapstat-asan
 # ── valgrind (build debug, run under valgrind) ───────────────────────
 valgrind: $(BINDIR)/pcapstat-debug
 	valgrind --leak-check=full --show-leak-kinds=definite,indirect \
+	         --suppressions=$(TESTDIR)/valgrind.supp \
 	         --error-exitcode=1 $(BINDIR)/pcapstat-debug $(ARGS)
 
 # ── unit-test ────────────────────────────────────────────────────────
@@ -79,7 +80,7 @@ unit-test: $(TEST_BINS)
 	@fail=0; \
 	for t in $(TEST_BINS); do \
 	    echo "--- $$t ---"; \
-	    $$t || fail=1; \
+	    LSAN_OPTIONS=suppressions=$(CURDIR)/$(TESTDIR)/lsan.supp $$t || fail=1; \
 	done; \
 	exit $$fail
 
