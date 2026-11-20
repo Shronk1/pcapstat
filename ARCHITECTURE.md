@@ -164,4 +164,7 @@ tie-breaking by category, subject, and description.
 
 ## Rendering & PDF
 
-*Placeholder — to be completed in TASK-09 / TASK-10.*
+Traffic visualization and report generation rely on `libcairo`:
+- **Shared Cairo Architecture:** Drawing routines in `charts.h` accept a borrowed `cairo_t *` and a bounding box `(x, y, w, h)`, isolating graphics state via `cairo_save()` and `cairo_restore()`. This enables direct vector embedding in PDF reports as well as standalone PNG export (`cairo_image_surface_create()`).
+- **Multi-Page PDF Report:** `report_generate()` produces an A4 (`595 x 842 pt`) PDF via `cairo_pdf_surface_create()`. The document is organized into Page 1 (Executive Summary & KPI cards), Page 2 (Top 10 Talkers, Destination Ports, and Flows with alternating zebra striping), Page 3 ($2 \times 2$ vector chart grid), and Page 4+ (detected anomalies with severity badges).
+- **Text Wrapping & Dynamic Pagination:** An internal text-wrapping engine evaluates word widths via `cairo_text_extents()` to prevent margin overflow across file lists and descriptions. Anomaly findings automatically paginate across multiple pages (`cairo_show_page()`) under running headers and footers with generation timestamps and pre-calculated `Page X of Y` indicators.
