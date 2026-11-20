@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 int anomaly_list_init(anomaly_list_t *list)
 {
@@ -97,6 +98,174 @@ static int compare_anomaly(const void *a, const void *b)
     return strcmp(x->description, y->description);
 }
 
+/* -------------------------------------------------------------------
+ * UDP burst helpers (rule 6)
+ * ------------------------------------------------------------------- */
+
+/** One flagged one-second bucket, collected before runs are merged. */
+typedef struct {
+    int64_t  sec;         /**< Epoch second of the bucket. */
+    uint64_t udp_packets; /**< UDP packets in that second. */
+    double   baseline;    /**< Leave-one-out baseline used for the check. */
+} udp_burst_sec_t;
+
+/**
+ * Leave-one-out UDP baseline for a bucket holding @p b of @p udp_total
+ * UDP packets spread over @p n active seconds: the mean of the *other*
+ * n - 1 seconds, so the burst cannot inflate its own threshold. 0 when
+ * the bucket is the only active second.
+ */
+static double udp_leave_one_out_baseline(uint64_t udp_total, uint64_t b,
+                                         size_t n)
+{
+    if (n < 2 || b > udp_total)
+        return 0.0;
+    return (double)(udp_total - b) / (double)(n - 1);
+}
+
+static bool udp_second_is_burst(uint64_t b, double baseline,
+                                const anomaly_thresholds_t *thresholds)
+{
+    return b >= thresholds->udp_burst_min &&
+           (double)b > thresholds->udp_burst_mult * baseline;
+}
+
+static int compare_udp_burst_sec(const void *left, const void *right)
+{
+    const udp_burst_sec_t *x = (const udp_burst_sec_t *)left;
+    const udp_burst_sec_t *y = (const udp_burst_sec_t *)right;
+    if (x->sec < y->sec)
+        return -1;
+    if (x->sec > y->sec)
+        return 1;
+    return 0;
+}
+
+/**
+ * Format an epoch second as "YYYY-MM-DD HH:MM:SS UTC". Falls back to
+ * "Epoch N s" when the year does not fit struct tm (kept short so it fits
+ * the report's subject column).
+ */
+static void format_utc_second(int64_t sec, char *buf, size_t len)
+{
+    time_t t = (time_t)sec;
+    struct tm tm;
+    if ((int64_t)t == sec && gmtime_r(&t, &tm) != NULL &&
+        strftime(buf, len, "%Y-%m-%d %H:%M:%S UTC", &tm) > 0)
+        return;
+    snprintf(buf, len, "Epoch %" PRId64 " s", sec);
+}
+
+/**
+ * Append one "UDP Burst" finding for @p len consecutive flagged seconds
+ * starting at @p run (sorted by second, len >= 1).
+ */
+static int append_udp_burst_run(const udp_burst_sec_t *run, size_t len,
+                                const anomaly_thresholds_t *thresholds,
+                                anomaly_list_t *out)
+{
+    size_t peak = 0;
+    uint64_t total = 0;
+    for (size_t i = 0; i < len; ++i) {
+        total += run[i].udp_packets;
+        if (run[i].udp_packets > run[peak].udp_packets)
+            peak = i;
+    }
+
+    anomaly_t a;
+    memset(&a, 0, sizeof(a));
+    a.severity = ANOMALY_WARNING;
+    snprintf(a.category, sizeof(a.category), "UDP Burst");
+    format_utc_second(run[0].sec, a.subject, sizeof(a.subject));
+    snprintf(a.description, sizeof(a.description),
+             "Burst lasted %zu s (%" PRIu64 " UDP pkts): peak %" PRIu64
+             " pkt/s vs. baseline %.1f pkt/s (mean of the other active"
+             " seconds); thresholds: > %.1fx baseline and >= %" PRIu32
+             " pkt/s",
+             len, total, run[peak].udp_packets, run[peak].baseline,
+             thresholds->udp_burst_mult, thresholds->udp_burst_min);
+    return anomaly_list_append(out, &a);
+}
+
+/**
+ * Rule 6: flag one-second buckets whose UDP count reaches the absolute
+ * minimum and exceeds the multiplier times the leave-one-out baseline,
+ * then report each run of consecutive flagged seconds as one finding.
+ */
+static int detect_udp_bursts(const stats_ctx_t *stats,
+                             const anomaly_thresholds_t *thresholds,
+                             anomaly_list_t *out)
+{
+    if (stats->ts_buckets_ht == NULL)
+        return PCAPSTAT_OK;
+    const size_t n = ht_count(stats->ts_buckets_ht);
+    if (n == 0)
+        return PCAPSTAT_OK;
+
+    const void *key;
+    size_t key_len;
+    void *val;
+
+    /* Pass 1: UDP total over the buckets (packets without a usable
+     * timestamp are in no bucket, so stats->udp_packets may be larger). */
+    uint64_t udp_total = 0;
+    ht_iter_t it = ht_iter_begin(stats->ts_buckets_ht);
+    while (ht_iter_next(&it, &key, &key_len, &val))
+        udp_total += ((const ts_bucket_t *)val)->udp_packets;
+    if (udp_total == 0)
+        return PCAPSTAT_OK;
+
+    /* Pass 2: count flagged seconds so the scratch array is exact. */
+    size_t flagged = 0;
+    it = ht_iter_begin(stats->ts_buckets_ht);
+    while (ht_iter_next(&it, &key, &key_len, &val)) {
+        const ts_bucket_t *b = (const ts_bucket_t *)val;
+        double base = udp_leave_one_out_baseline(udp_total, b->udp_packets, n);
+        if (udp_second_is_burst(b->udp_packets, base, thresholds))
+            flagged++;
+    }
+    if (flagged == 0)
+        return PCAPSTAT_OK;
+
+    int rc = PCAPSTAT_OK;
+    udp_burst_sec_t *secs =
+        (udp_burst_sec_t *)malloc(flagged * sizeof(*secs));
+    if (secs == NULL)
+        return PCAPSTAT_ERR_NOMEM;
+
+    /* Pass 3: collect flagged seconds. */
+    size_t count = 0;
+    it = ht_iter_begin(stats->ts_buckets_ht);
+    while (count < flagged && ht_iter_next(&it, &key, &key_len, &val)) {
+        const ts_bucket_t *b = (const ts_bucket_t *)val;
+        double base = udp_leave_one_out_baseline(udp_total, b->udp_packets, n);
+        if (udp_second_is_burst(b->udp_packets, base, thresholds)) {
+            secs[count].sec = b->sec;
+            secs[count].udp_packets = b->udp_packets;
+            secs[count].baseline = base;
+            count++;
+        }
+    }
+    qsort(secs, count, sizeof(*secs), compare_udp_burst_sec);
+
+    /* Merge runs of consecutive seconds. Sorted and distinct, so
+     * secs[i - 1].sec < secs[i].sec and the + 1 cannot overflow. */
+    size_t run_start = 0;
+    for (size_t i = 1; i <= count; ++i) {
+        if (i < count && secs[i].sec == secs[i - 1].sec + 1)
+            continue;
+        rc = append_udp_burst_run(&secs[run_start], i - run_start,
+                                  thresholds, out);
+        if (rc != PCAPSTAT_OK)
+            goto cleanup;
+        run_start = i;
+    }
+
+cleanup:
+    free(secs);
+    return rc;
+}
+
 int anomaly_detect(const stats_ctx_t *stats,
                    const anomaly_thresholds_t *thresholds,
                    anomaly_list_t *out)
@@ -140,7 +309,11 @@ int anomaly_detect(const stats_ctx_t *stats,
 
     /* -----------------------------------------------------------------
      * 2. SYN Flood / Incomplete Handshakes:
-     *    High SYN count (>= 50) with SYN to SYN-ACK ratio > 3.0
+     *    High SYN count (>= 50) with SYN to SYN-ACK ratio > 3.0.
+     *    A host that also meets the port-scan threshold is reported only
+     *    as a Port Scan (rule 1): its unanswered SYNs are the probes.
+     *    host_syn_flood is set either way (the SYN excess is attributed
+     *    to a host), so the global fallback below behaves as before.
      * ----------------------------------------------------------------- */
     bool host_syn_flood = false;
     if (stats->hosts_ht != NULL) {
@@ -156,6 +329,9 @@ int anomaly_detect(const stats_ctx_t *stats,
                                    : ((double)h->syn_sent /
                                       (double)h->syn_ack_recv);
                 if (ratio > thresholds->syn_ratio) {
+                    host_syn_flood = true;
+                    if (h->unique_dst_ports >= thresholds->portscan_threshold)
+                        continue; /* already reported by rule 1 */
                     memset(&a, 0, sizeof(a));
                     a.severity = ANOMALY_CRITICAL;
                     snprintf(a.category, sizeof(a.category), "SYN Flood");
@@ -169,7 +345,6 @@ int anomaly_detect(const stats_ctx_t *stats,
                     rc = anomaly_list_append(out, &a);
                     if (rc != PCAPSTAT_OK)
                         return rc;
-                    host_syn_flood = true;
                 }
             }
         }
@@ -335,69 +510,14 @@ int anomaly_detect(const stats_ctx_t *stats,
 
     /* -----------------------------------------------------------------
      * 6. UDP Burst / Flood:
-     *    Any 1-second window where UDP packet count exceeds 3x the mean
-     *    and an absolute minimum (>= 100 pkt/s)
+     *    A 1-second bucket with UDP count >= the absolute minimum
+     *    (100 pkt/s) and > 3x the leave-one-out baseline (mean of the
+     *    other active seconds). Consecutive flagged seconds are merged
+     *    into one finding.
      * ----------------------------------------------------------------- */
-    size_t num_buckets = 0;
-    if (stats->ts_buckets_ht != NULL)
-        num_buckets = ht_count(stats->ts_buckets_ht);
-    else if (stats->timeline != NULL)
-        num_buckets = stats->timeline_count;
-
-    if (num_buckets > 0 && stats->udp_packets > 0) {
-        double mean_udp = (double)stats->udp_packets / (double)num_buckets;
-        double burst_thresh = thresholds->udp_burst_mult * mean_udp;
-
-        if (stats->ts_buckets_ht != NULL && ht_count(stats->ts_buckets_ht) > 0) {
-            ht_iter_t it = ht_iter_begin(stats->ts_buckets_ht);
-            const void *key;
-            size_t key_len;
-            void *val;
-            while (ht_iter_next(&it, &key, &key_len, &val)) {
-                const ts_bucket_t *b = (const ts_bucket_t *)val;
-                if (b->udp_packets >= thresholds->udp_burst_min &&
-                    (double)b->udp_packets > burst_thresh) {
-                    memset(&a, 0, sizeof(a));
-                    a.severity = ANOMALY_WARNING;
-                    snprintf(a.category, sizeof(a.category), "UDP Burst");
-                    snprintf(a.subject, sizeof(a.subject),
-                             "Second %" PRId64, b->sec);
-                    snprintf(a.description, sizeof(a.description),
-                             "UDP burst of %" PRIu64
-                             " pkt/s exceeds %.1fx mean (%.1f pkt/s, min: %" PRIu32
-                             " pkt/s)",
-                             b->udp_packets, thresholds->udp_burst_mult,
-                             mean_udp, thresholds->udp_burst_min);
-                    rc = anomaly_list_append(out, &a);
-                    if (rc != PCAPSTAT_OK)
-                        return rc;
-                }
-            }
-        } else if (stats->timeline != NULL) {
-            for (size_t i = 0; i < stats->timeline_count; ++i) {
-                const ts_bucket_t *b = &stats->timeline[i];
-                uint64_t peak = b->udp_packets_max > 0 ? b->udp_packets_max
-                                                       : b->udp_packets;
-                if (peak >= thresholds->udp_burst_min &&
-                    (double)peak > burst_thresh) {
-                    memset(&a, 0, sizeof(a));
-                    a.severity = ANOMALY_WARNING;
-                    snprintf(a.category, sizeof(a.category), "UDP Burst");
-                    snprintf(a.subject, sizeof(a.subject),
-                             "Second %" PRId64, b->sec);
-                    snprintf(a.description, sizeof(a.description),
-                             "UDP burst of %" PRIu64
-                             " pkt/s exceeds %.1fx mean (%.1f pkt/s, min: %" PRIu32
-                             " pkt/s)",
-                             peak, thresholds->udp_burst_mult, mean_udp,
-                             thresholds->udp_burst_min);
-                    rc = anomaly_list_append(out, &a);
-                    if (rc != PCAPSTAT_OK)
-                        return rc;
-                }
-            }
-        }
-    }
+    rc = detect_udp_bursts(stats, thresholds, out);
+    if (rc != PCAPSTAT_OK)
+        return rc;
 
     /* -----------------------------------------------------------------
      * 7. Malformed / Truncated Packets:

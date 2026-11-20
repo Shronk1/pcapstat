@@ -31,8 +31,9 @@
  * or comparison can order critical alerts first.
  */
 typedef enum anomaly_severity {
-    ANOMALY_INFO     = 0, /**< Informational event (e.g., malformed frame). */
-    ANOMALY_WARNING  = 1, /**< Suspicious event (e.g., elevated retransmissions). */
+    ANOMALY_INFO     = 0, /**< Informational event (reserved: no built-in rule emits it yet). */
+    ANOMALY_WARNING  = 1, /**< Suspicious event (e.g., elevated retransmissions,
+                               UDP burst, malformed packets). */
     ANOMALY_CRITICAL = 2  /**< High-risk threat (e.g., port scan, SYN flood, flag scan). */
 } anomaly_severity_t;
 
@@ -45,7 +46,9 @@ typedef enum anomaly_severity {
 typedef struct {
     anomaly_severity_t severity;    /**< Severity level of the finding. */
     char category[64];              /**< Anomaly category (e.g., "Port Scan"). */
-    char subject[128];              /**< Offending entity (IP, flow 5-tuple, or "Global"). */
+    char subject[128];              /**< Offending entity: IP address, flow 5-tuple,
+                                         flag pattern (e.g., "Null Scan"), burst start
+                                         time ("YYYY-MM-DD HH:MM:SS UTC"), or "Global". */
     char description[256];          /**< Detailed explanation including metrics. */
 } anomaly_t;
 
@@ -112,23 +115,54 @@ const char *anomaly_severity_str(anomaly_severity_t severity);
  * Detected anomalies are appended to @p out and sorted in descending order
  * of severity (ANOMALY_CRITICAL -> ANOMALY_WARNING -> ANOMALY_INFO).
  * If multiple anomalies share the same severity, tie-breaking is deterministic
- * (by category, then subject).
+ * (by category, then subject, then description).
  *
  * Rules evaluated:
- *  1. Port Scan: host targeted >= threshold unique destination ports (SYN/UDP).
- *  2. SYN Flood: host sent >= min SYN packets with SYN / SYN-ACK ratio > threshold.
- *  3. Elevated Retransmissions: retransmission rate > threshold % per flow (min 20 pkts)
- *     or globally across all flows.
- *  4. RST Spike: RST packets exceed > threshold % of TCP traffic (min 30 pkts).
- *  5. Suspicious TCP Flags: any Null Scan, Xmas Scan, SYN+FIN, or SYN+RST segment.
- *  6. UDP Burst / Flood: any 1-second window where UDP packet count exceeds
- *     multiplier * mean and absolute minimum (pkt/s).
- *  7. Malformed Packets: flagged if malformed_packets > 0.
+ *  1. Port Scan (CRITICAL): a host probed >= portscan_threshold distinct
+ *     destination ports (host_stats_t::unique_dst_ports: pure TCP SYNs and
+ *     non-reply UDP datagrams).
+ *  2. SYN Flood (CRITICAL): a host sent >= syn_flood_min pure SYNs with a
+ *     SYN / SYN-ACK-received ratio > syn_ratio (0 SYN-ACKs: ratio = SYN count).
+ *     Dedup: a host that also meets the port-scan threshold is reported only
+ *     as a Port Scan, since its unanswered SYNs are the scan probes.
+ *     Global fallback: if no host met the SYN-flood criteria (reported or
+ *     deduplicated), the same test is applied to the global SYN / SYN-ACK
+ *     counters (subject "Global"), e.g. for floods from spoofed sources.
+ *  3. Elevated Retransmissions (WARNING): retransmission rate > retrans_pct
+ *     per TCP flow (min 20 pkts); if no flow is flagged, the retransmissions
+ *     summed over all flows are checked against all TCP packets (min 20).
+ *  4. RST Spike (WARNING): RST packets > rst_pct of TCP traffic (min 30 pkts).
+ *  5. Suspicious TCP Flags (CRITICAL): any Null Scan, Xmas Scan, SYN+FIN,
+ *     or SYN+RST segment (one finding per pattern).
+ *  6. UDP Burst / Flood (WARNING): a one-second bucket with `b` UDP packets
+ *     is flagged when `b >= udp_burst_min` and `b > udp_burst_mult * baseline`.
+ *     The baseline is leave-one-out: `(U - b) / (n - 1)`, where U is the UDP
+ *     total over all n active seconds (buckets with any timestamped traffic),
+ *     so a short burst cannot inflate its own threshold; with a single active
+ *     second (n == 1) the baseline is 0 and only the absolute minimum applies.
+ *     Consecutive flagged seconds are merged into one finding: subject = UTC
+ *     start time "YYYY-MM-DD HH:MM:SS UTC" ("Epoch N s" if the year does not
+ *     fit struct tm), description = duration, total and peak pkt/s, the
+ *     peak second's baseline and the thresholds.
+ *     Limitation: a capture that is entirely a constant flood has no quiet
+ *     baseline (every second's baseline equals the flood rate) and is not
+ *     flagged. More generally, a constant-rate flood in otherwise idle
+ *     traffic is flagged only while it covers less than about
+ *     1 / udp_burst_mult of the active seconds (a third by default).
+ *  7. Malformed Packets (WARNING): flagged if malformed_packets > 0.
  *
- * @param stats Validated, finalized or aggregated statistics context.
+ * Reads the live tables (hosts_ht, flows_ht, ts_buckets_ht) and global
+ * counters; stats_finalize() is not required. Tables that are NULL are
+ * skipped.
+ *
+ * @param stats Initialized statistics context (borrowed, not modified).
  * @param thresholds Configured detection thresholds. If NULL, default
  *                   thresholds from common.h are used.
- * @param[out] out Initialized anomaly list to receive findings.
+ * @param[out] out Initialized anomaly list to receive findings. Findings are
+ *                 appended; on success the whole list (including items that
+ *                 were already present) is sorted. On error @p out may hold
+ *                 a partial, unsorted set; the caller still owns it and must
+ *                 free it with anomaly_list_free().
  * @return PCAPSTAT_OK on success,
  *         PCAPSTAT_ERR_ARGS if @p stats or @p out is NULL,
  *         PCAPSTAT_ERR_NOMEM on memory allocation failure.
