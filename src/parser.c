@@ -10,6 +10,7 @@
 #include "parser.h"
 
 #include <arpa/inet.h>
+#include <inttypes.h>
 #include <net/ethernet.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
@@ -30,6 +31,9 @@
 /* EtherType values */
 #define ETHERTYPE_VLAN_8021Q  0x8100
 #define ETHERTYPE_VLAN_QINQ   0x88A8
+
+/* IPv4 fragment-offset field (low 13 bits of frag_off, host order). */
+#define IPV4_FRAG_OFFSET_MASK 0x1FFF
 
 /* ── Forward declarations ───────────────────────────────────────────── */
 
@@ -52,10 +56,29 @@ int parser_process_file(const char *filepath,
                         packet_handler_fn cb,
                         void *user_data)
 {
+    return parser_process_file_ex(filepath, cb, user_data, NULL);
+}
+
+int parser_process_file_ex(const char *filepath,
+                           packet_handler_fn cb,
+                           void *user_data,
+                           parser_file_info_t *info)
+{
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *handle = pcap_open_offline(filepath, errbuf);
+    pcap_t *handle  = NULL;
+    uint64_t delivered = 0;
+    bool stopped    = false;   /* callback asked to stop */
+    int ret         = PCAPSTAT_OK;
+
+    if (info != NULL)
+        memset(info, 0, sizeof(*info));
+
+    errbuf[0] = '\0';
+    handle = pcap_open_offline(filepath, errbuf);
     if (!handle) {
         fprintf(stderr, "pcapstat: cannot open '%s': %s\n", filepath, errbuf);
+        if (info != NULL)
+            snprintf(info->error, sizeof(info->error), "%s", errbuf);
         return PCAPSTAT_ERR_IO;
     }
 
@@ -75,14 +98,16 @@ int parser_process_file(const char *filepath,
     default:
         fprintf(stderr, "pcapstat: unsupported link type %d in '%s'\n",
                 dlt, filepath);
-        pcap_close(handle);
-        return PCAPSTAT_ERR_PCAP;
+        if (info != NULL)
+            snprintf(info->error, sizeof(info->error),
+                     "unsupported link type %d", dlt);
+        ret = PCAPSTAT_ERR_PCAP;
+        goto cleanup;
     }
 
     struct pcap_pkthdr *hdr = NULL;
     const uint8_t *raw      = NULL;
     int rc;
-    int ret = PCAPSTAT_OK;
 
     while ((rc = pcap_next_ex(handle, &hdr, &raw)) == 1) {
         parsed_packet_t pkt;
@@ -117,6 +142,12 @@ int parser_process_file(const char *filepath,
                 memcpy(&inner_raw, raw + offset + 2, sizeof(inner_raw));
                 ethertype = ntohs(inner_raw);
                 offset += VLAN_TAG_LEN;
+            }
+            if (ethertype == ETHERTYPE_VLAN_8021Q ||
+                ethertype == ETHERTYPE_VLAN_QINQ) {
+                /* VLAN tag runs past caplen: truncated L2 header. */
+                pkt.is_malformed = true;
+                goto invoke_cb;
             }
         } else if (dlt_is_sll) {
             if (pkt.cap_len < SLL_HDR_LEN) {
@@ -160,11 +191,42 @@ int parser_process_file(const char *filepath,
         decode_ip(raw, pkt.cap_len, offset, ethertype, &pkt);
 
 invoke_cb:
+        delivered++;
         ret = cb(&pkt, user_data);
-        if (ret != 0)
+        if (ret != 0) {
+            stopped = true;
             break;
+        }
     }
 
+    /* Offline reads end with PCAP_ERROR_BREAK at a clean EOF; anything
+     * else (PCAP_ERROR) means a truncated or corrupt record.  Fetch the
+     * error text before pcap_close() releases the handle. */
+    if (!stopped && rc != PCAP_ERROR_BREAK) {
+        const char *perr = pcap_geterr(handle);
+        if (perr == NULL)
+            perr = "unknown read error";
+        if (info != NULL)
+            snprintf(info->error, sizeof(info->error), "%s", perr);
+
+        if (delivered == 0) {
+            fprintf(stderr, "pcapstat: cannot read '%s': %s\n",
+                    filepath, perr);
+            ret = PCAPSTAT_ERR_PCAP;
+        } else {
+            /* Keep what was readable (e.g. a capture killed mid-write). */
+            fprintf(stderr,
+                    "pcapstat: warning: '%s': %s (stopped after %" PRIu64
+                    " packets)\n", filepath, perr, delivered);
+            if (info != NULL)
+                info->truncated = true;
+            ret = PCAPSTAT_OK;
+        }
+    }
+
+cleanup:
+    if (info != NULL)
+        info->packets = delivered;
     pcap_close(handle);
     return ret;
 }
@@ -178,11 +240,14 @@ void parser_format_ip(uint8_t ip_version,
         return;
     buf[0] = '\0';
 
+    const char *res = buf;
     if (ip_version == 4) {
-        inet_ntop(AF_INET, ip, buf, (socklen_t)buf_len);
+        res = inet_ntop(AF_INET, ip, buf, (socklen_t)buf_len);
     } else if (ip_version == 6) {
-        inet_ntop(AF_INET6, ip, buf, (socklen_t)buf_len);
+        res = inet_ntop(AF_INET6, ip, buf, (socklen_t)buf_len);
     }
+    if (res == NULL)   /* ENOSPC: contents unspecified, keep it empty. */
+        buf[0] = '\0';
 }
 
 /* ── Static helpers ─────────────────────────────────────────────────── */
@@ -196,9 +261,10 @@ static void decode_ip(const uint8_t *data, uint32_t caplen,
     } else if (ethertype == ETHERTYPE_IPV6) {
         decode_ipv6(data, caplen, offset, pkt);
     } else {
-        /* Unknown or unsupported L3 — not necessarily malformed,
-         * just not TCP/UDP traffic we care about. */
-        pkt->is_malformed = true;
+        /* Well-formed L2 frame carrying a non-IP protocol (ARP, LLDP,
+         * STP, ...): not malformed, just outside IP analysis.  The L3/L4
+         * fields stay zero (ip_version == 0). */
+        pkt->is_non_ip = true;
     }
 }
 
@@ -221,7 +287,13 @@ static void decode_ipv4(const uint8_t *data, uint32_t caplen,
     }
 
     uint32_t ip_hdr_len = (uint32_t)ihl * 4;
-    uint16_t tot_len    = ntohs(iph.tot_len);
+    uint32_t tot_len    = ntohs(iph.tot_len);
+
+    /* tot_len == 0 is written by TCP segmentation offload / BIG TCP when
+     * the capture is taken on the sending host: the length is only known
+     * from the frame itself. */
+    if (tot_len == 0)
+        tot_len = (pkt->wire_len > offset) ? pkt->wire_len - offset : 0;
 
     if (tot_len < ip_hdr_len) {
         pkt->is_malformed = true;
@@ -239,8 +311,17 @@ static void decode_ipv4(const uint8_t *data, uint32_t caplen,
     memcpy(pkt->dst_ip, &iph.daddr, 4);
     pkt->proto = iph.protocol;
 
+    /* Non-first fragment: the bytes after the IP header are the middle of
+     * the datagram, not an L4 header.  Keep L3 fields, skip L4 decoding
+     * (ports, TCP fields and payload_len stay 0).  First fragments
+     * (offset 0, MF set) carry the real L4 header and are decoded. */
+    if ((ntohs(iph.frag_off) & IPV4_FRAG_OFFSET_MASK) != 0) {
+        pkt->is_fragment = true;
+        return;
+    }
+
     uint32_t l4_offset      = offset + ip_hdr_len;
-    uint32_t ip_payload_len = (uint32_t)tot_len - ip_hdr_len;
+    uint32_t ip_payload_len = tot_len - ip_hdr_len;
 
     /* Decode L4 */
     if (pkt->proto == IPPROTO_TCP) {
@@ -269,6 +350,11 @@ static void decode_ipv6(const uint8_t *data, uint32_t caplen,
 
     uint32_t ip_payload_len = (uint32_t)ntohs(ip6h.ip6_plen);
     uint32_t l4_offset      = offset + IPV6_HDR_LEN;
+
+    /* ip6_plen == 0 (BIG TCP / jumbogram): length taken from the frame. */
+    if (ip_payload_len == 0)
+        ip_payload_len = (pkt->wire_len > l4_offset)
+                       ? pkt->wire_len - l4_offset : 0;
 
     /* NOTE: We decode only the base header (next-header directly).
      * Extension header chaining is not implemented. */
