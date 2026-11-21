@@ -625,13 +625,74 @@ static void test_udp_flood_without_baseline(void)
     anomaly_list_free(&list);
     stats_free(&ctx);
 
+    /* Owner decision (FIX-06): a capture with a single active second has
+     * no baseline, so even 100 000 UDP pkt/s produce no UDP Burst finding
+     * (FIX-04 flagged it against a 0.0 baseline). */
     CHECK(stats_init(&ctx) == PCAPSTAT_OK);
     send_udp_seconds(&ctx, 500, 1, 100);
     CHECK(anomaly_list_init(&list) == PCAPSTAT_OK);
     CHECK(anomaly_detect(&ctx, NULL, &list) == PCAPSTAT_OK);
+    CHECK(count_category(&list, "UDP Burst") == 0);
+    anomaly_list_free(&list);
+    stats_free(&ctx);
+
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+    send_udp_seconds(&ctx, 500, 1, 100000);
+    CHECK(anomaly_list_init(&list) == PCAPSTAT_OK);
+    CHECK(anomaly_detect(&ctx, NULL, &list) == PCAPSTAT_OK);
+    CHECK(count_category(&list, "UDP Burst") == 0);
+    anomaly_list_free(&list);
+    stats_free(&ctx);
+
+    /* Two active seconds already give a baseline: a 100-pkt second next
+     * to a 1-pkt second is flagged (leave-one-out baseline 1.0). */
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+    send_udp_seconds(&ctx, 500, 1, 100);
+    send_udp_seconds(&ctx, 501, 1, 1);
+    CHECK(anomaly_list_init(&list) == PCAPSTAT_OK);
+    CHECK(anomaly_detect(&ctx, NULL, &list) == PCAPSTAT_OK);
     CHECK(count_category(&list, "UDP Burst") == 1);
     CHECK(find_anomaly(&list, "UDP Burst", "1970-01-01 00:08:20 UTC") != NULL);
-    CHECK(strstr(list.items[0].description, "baseline 0.0 pkt/s") != NULL);
+    CHECK(strstr(list.items[0].description, "baseline 1.0 pkt/s") != NULL);
+    anomaly_list_free(&list);
+    stats_free(&ctx);
+}
+
+/* FIX-06: rule 8 "Capture Integrity" fires only when main recorded a
+ * truncated input file. */
+static void test_capture_integrity(void)
+{
+    stats_ctx_t ctx;
+    anomaly_list_t list;
+
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+    send_pkt(&ctx, make_ipv4_pkt(1.0, IPPROTO_UDP, 1, 2, 5000, 53, 0, 60));
+    ctx.files_processed = 3;
+    CHECK(anomaly_list_init(&list) == PCAPSTAT_OK);
+    CHECK(anomaly_detect(&ctx, NULL, &list) == PCAPSTAT_OK);
+    CHECK(count_category(&list, "Capture Integrity") == 0);
+    CHECK(list.count == 0);
+    anomaly_list_free(&list);
+
+    ctx.truncated_files = 2;
+    CHECK(anomaly_list_init(&list) == PCAPSTAT_OK);
+    CHECK(anomaly_detect(&ctx, NULL, &list) == PCAPSTAT_OK);
+    CHECK(list.count == 1);
+    const anomaly_t *ci = find_anomaly(&list, "Capture Integrity",
+                                       "2 of 3 file(s)");
+    CHECK(ci != NULL);
+    CHECK(ci->severity == ANOMALY_WARNING);
+    CHECK(strcmp(ci->description,
+                 "2 input file(s) truncated or corrupt; statistics cover"
+                 " only the readable part") == 0);
+    anomaly_list_free(&list);
+
+    /* Hand-built context without files_processed: plain count. */
+    ctx.files_processed = 0;
+    ctx.truncated_files = 1;
+    CHECK(anomaly_list_init(&list) == PCAPSTAT_OK);
+    CHECK(anomaly_detect(&ctx, NULL, &list) == PCAPSTAT_OK);
+    CHECK(find_anomaly(&list, "Capture Integrity", "1 file(s)") != NULL);
     anomaly_list_free(&list);
     stats_free(&ctx);
 }
@@ -776,6 +837,7 @@ int main(void)
     RUN(test_udp_burst_separate_runs);
     RUN(test_udp_flood_without_baseline);
     RUN(test_udp_burst_subject_edge_times);
+    RUN(test_capture_integrity);
     RUN(test_port_scanner_not_syn_flood);
     RUN(test_syn_flood_single_port_with_scanner);
     RUN(test_demo_pcap_twice_no_syn_flood);

@@ -18,11 +18,13 @@
 #include <string.h>
 #include <time.h>
 
+/* Chart file names written by charts_generate_all() (single source of
+ * truth: the CHART_FILE_* macros in charts.h). */
 static const char *const k_png_names[] = {
-    "traffic_timeline.png",
-    "protocol_ports.png",
-    "packet_sizes.png",
-    "tcp_flags.png",
+    CHART_FILE_TRAFFIC_TIMELINE,
+    CHART_FILE_PROTOCOL_PORTS,
+    CHART_FILE_PACKET_SIZES,
+    CHART_FILE_TCP_FLAGS,
 };
 
 static double now_sec(void)
@@ -119,7 +121,8 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    rc = join_path(pdf_path, sizeof(pdf_path), cfg.output_dir, "report.pdf");
+    rc = join_path(pdf_path, sizeof(pdf_path), cfg.output_dir,
+                   REPORT_DEFAULT_FILENAME);
     if (rc != PCAPSTAT_OK) {
         fprintf(stderr, "pcapstat: output path too long\n");
         goto cleanup;
@@ -135,11 +138,15 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < cfg.input_count; i++) {
         if (cfg.verbose)
             fprintf(stderr, "pcapstat: processing '%s'\n", cfg.input_files[i]);
-        rc = parser_process_file(cfg.input_files[i], stats_packet_cb, &stats);
+        parser_file_info_t info;
+        rc = parser_process_file_ex(cfg.input_files[i], stats_packet_cb,
+                                    &stats, &info);
         if (rc != PCAPSTAT_OK) {
-            /* Positive values would mean the callback stopped early; the stats
-             * callback only returns 0 or negative codes, so treat any non-zero
-             * as failure. */
+            /* parser_process_file_ex() returns the callback's value
+             * unchanged when it stops parsing; stats_packet_cb() only
+             * returns 0 or a negative pcapstat_err, so a positive value is
+             * unexpected and is mapped to a generic pcap failure to keep
+             * rc a negative pcapstat_err. */
             if (rc > 0)
                 rc = PCAPSTAT_ERR_PCAP;
             fprintf(stderr, "pcapstat: failed to process '%s' (error %d)\n",
@@ -147,6 +154,10 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         stats.files_processed++;
+        /* A truncated/corrupt tail: the parser already printed the
+         * warning; record it for the "Capture Integrity" finding. */
+        if (info.truncated)
+            stats.truncated_files++;
     }
 
     rc = stats_finalize(&stats);

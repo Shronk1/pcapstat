@@ -112,8 +112,9 @@ typedef struct {
 /**
  * Leave-one-out UDP baseline for a bucket holding @p b of @p udp_total
  * UDP packets spread over @p n active seconds: the mean of the *other*
- * n - 1 seconds, so the burst cannot inflate its own threshold. 0 when
- * the bucket is the only active second.
+ * n - 1 seconds, so the burst cannot inflate its own threshold. Only
+ * called with n >= 2 (a single active second has no baseline and is never
+ * flagged, see detect_udp_bursts()); returns 0 defensively otherwise.
  */
 static double udp_leave_one_out_baseline(uint64_t udp_total, uint64_t b,
                                          size_t n)
@@ -199,7 +200,9 @@ static int detect_udp_bursts(const stats_ctx_t *stats,
     if (stats->ts_buckets_ht == NULL)
         return PCAPSTAT_OK;
     const size_t n = ht_count(stats->ts_buckets_ht);
-    if (n == 0)
+    /* Owner decision (FIX-06): with fewer than two active seconds there is
+     * no baseline to compare against, so nothing is flagged. */
+    if (n < 2)
         return PCAPSTAT_OK;
 
     const void *key;
@@ -513,7 +516,7 @@ int anomaly_detect(const stats_ctx_t *stats,
      *    A 1-second bucket with UDP count >= the absolute minimum
      *    (100 pkt/s) and > 3x the leave-one-out baseline (mean of the
      *    other active seconds). Consecutive flagged seconds are merged
-     *    into one finding.
+     *    into one finding. Needs >= 2 active seconds (no baseline else).
      * ----------------------------------------------------------------- */
     rc = detect_udp_bursts(stats, thresholds, out);
     if (rc != PCAPSTAT_OK)
@@ -531,6 +534,31 @@ int anomaly_detect(const stats_ctx_t *stats,
         snprintf(a.description, sizeof(a.description),
                  "Detected %" PRIu64 " malformed or truncated packet(s)",
                  stats->malformed_packets);
+        rc = anomaly_list_append(out, &a);
+        if (rc != PCAPSTAT_OK)
+            return rc;
+    }
+
+    /* -----------------------------------------------------------------
+     * 8. Capture Integrity:
+     *    Flag (WARNING) if any input file stopped on a truncated or
+     *    corrupt record (stats->truncated_files, maintained by main).
+     * ----------------------------------------------------------------- */
+    if (stats->truncated_files > 0) {
+        memset(&a, 0, sizeof(a));
+        a.severity = ANOMALY_WARNING;
+        snprintf(a.category, sizeof(a.category), "Capture Integrity");
+        if (stats->files_processed >= stats->truncated_files)
+            snprintf(a.subject, sizeof(a.subject),
+                     "%" PRIu64 " of %" PRIu64 " file(s)",
+                     stats->truncated_files, stats->files_processed);
+        else
+            snprintf(a.subject, sizeof(a.subject), "%" PRIu64 " file(s)",
+                     stats->truncated_files);
+        snprintf(a.description, sizeof(a.description),
+                 "%" PRIu64 " input file(s) truncated or corrupt; statistics"
+                 " cover only the readable part",
+                 stats->truncated_files);
         rc = anomaly_list_append(out, &a);
         if (rc != PCAPSTAT_OK)
             return rc;

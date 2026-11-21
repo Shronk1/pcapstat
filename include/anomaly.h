@@ -33,7 +33,8 @@
 typedef enum anomaly_severity {
     ANOMALY_INFO     = 0, /**< Informational event (reserved: no built-in rule emits it yet). */
     ANOMALY_WARNING  = 1, /**< Suspicious event (e.g., elevated retransmissions,
-                               UDP burst, malformed packets). */
+                               UDP burst, malformed packets, truncated
+                               input files). */
     ANOMALY_CRITICAL = 2  /**< High-risk threat (e.g., port scan, SYN flood, flag scan). */
 } anomaly_severity_t;
 
@@ -138,8 +139,8 @@ const char *anomaly_severity_str(anomaly_severity_t severity);
  *     is flagged when `b >= udp_burst_min` and `b > udp_burst_mult * baseline`.
  *     The baseline is leave-one-out: `(U - b) / (n - 1)`, where U is the UDP
  *     total over all n active seconds (buckets with any timestamped traffic),
- *     so a short burst cannot inflate its own threshold; with a single active
- *     second (n == 1) the baseline is 0 and only the absolute minimum applies.
+ *     so a short burst cannot inflate its own threshold. A capture with a
+ *     single active second (n == 1) has no baseline and is never flagged.
  *     Consecutive flagged seconds are merged into one finding: subject = UTC
  *     start time "YYYY-MM-DD HH:MM:SS UTC" ("Epoch N s" if the year does not
  *     fit struct tm), description = duration, total and peak pkt/s, the
@@ -150,9 +151,15 @@ const char *anomaly_severity_str(anomaly_severity_t severity);
  *     traffic is flagged only while it covers less than about
  *     1 / udp_burst_mult of the active seconds (a third by default).
  *  7. Malformed Packets (WARNING): flagged if malformed_packets > 0.
+ *  8. Capture Integrity (WARNING): flagged if truncated_files > 0, i.e. at
+ *     least one input file stopped on a truncated or corrupt record.
+ *     Subject "T of F file(s)" (T = truncated_files, F = files_processed;
+ *     "T file(s)" if F < T), description "T input file(s) truncated or
+ *     corrupt; statistics cover only the readable part".
  *
  * Reads the live tables (hosts_ht, flows_ht, ts_buckets_ht) and global
- * counters; stats_finalize() is not required. Tables that are NULL are
+ * counters (including the caller-maintained files_processed and
+ * truncated_files); stats_finalize() is not required. Tables that are NULL are
  * skipped.
  *
  * @param stats Initialized statistics context (borrowed, not modified).

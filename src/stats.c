@@ -445,7 +445,13 @@ static bool udp_is_reply(stats_ctx_t *ctx, const parsed_packet_t *pkt)
     return ht_get(ctx->flows_ht, &rev, sizeof(rev)) != NULL;
 }
 
-static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt)
+/*
+ * Update source tx and destination rx counters. For an IPv4 non-first
+ * fragment (@p l4_absent) the ports and TCP flags are not real, so the
+ * SYN/RST counters and the probed-port set are left untouched.
+ */
+static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt,
+                       bool l4_absent)
 {
     host_key_t src_key;
     host_key_t dst_key;
@@ -494,6 +500,8 @@ static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt)
     dst->rx_packets++;
     dst->rx_bytes += pkt->wire_len;
 
+    if (l4_absent)
+        return PCAPSTAT_OK;
     if (pkt->proto == IPPROTO_TCP) {
         const uint8_t syn = (uint8_t)TH_SYN;
         const uint8_t ack = (uint8_t)TH_ACK;
@@ -706,28 +714,44 @@ int stats_update(stats_ctx_t *ctx, const parsed_packet_t *pkt)
     }
 
     /* Exactly one category per packet:
-     * malformed | tcp | udp | other (see invariants in stats.h). */
+     * malformed | non_ip | tcp | udp | other (see invariants in stats.h).
+     * IPv4 non-first fragments count in tcp/udp/other by proto (plus the
+     * informational ip_fragments), but carry no L4 header, so they never
+     * touch the TCP flag counters, ports, flows or port-scan sets. */
+    const bool is_non_ip = !pkt->is_malformed && pkt->is_non_ip;
+    const bool is_fragment =
+        !pkt->is_malformed && !is_non_ip && pkt->is_fragment;
+
     if (pkt->is_malformed) {
         ctx->malformed_packets++;
+    } else if (is_non_ip) {
+        ctx->non_ip_packets++;
     } else if (pkt->proto == IPPROTO_TCP) {
         ctx->tcp_packets++;
         ctx->tcp_bytes += pkt->wire_len;
-        update_tcp_flags(ctx, pkt->tcp_flags);
+        if (!is_fragment)
+            update_tcp_flags(ctx, pkt->tcp_flags);
     } else if (pkt->proto == IPPROTO_UDP) {
         ctx->udp_packets++;
         ctx->udp_bytes += pkt->wire_len;
     } else {
         ctx->other_packets++;
     }
+    if (is_fragment)
+        ctx->ip_fragments++;
 
     /* Hosts/ports/flows need a decoded L3 header. The parser always sets
-     * ip_version for non-malformed packets; the check keeps hand-built
-     * packets (tests) from collapsing into one all-zero flow. */
-    if (!pkt->is_malformed && pkt->ip_version != 0) {
-        int rc = update_host(ctx, pkt);
+     * ip_version for IP packets that are not malformed; the check keeps
+     * hand-built packets (tests) from collapsing into one all-zero flow.
+     * Fragments update host tx/rx only (update_host() skips their L4). */
+    if (!pkt->is_malformed && !is_non_ip && pkt->ip_version != 0) {
+        int rc = update_host(ctx, pkt, is_fragment);
         if (rc != PCAPSTAT_OK)
             return rc;
-        rc = update_port(ctx, pkt);
+    }
+    if (!pkt->is_malformed && !is_non_ip && !is_fragment &&
+        pkt->ip_version != 0) {
+        int rc = update_port(ctx, pkt);
         if (rc != PCAPSTAT_OK)
             return rc;
         rc = update_flow(ctx, pkt);
@@ -756,8 +780,8 @@ int stats_update(stats_ctx_t *ctx, const parsed_packet_t *pkt)
 
     bucket->packets++;
     bucket->bytes += pkt->wire_len;
-    if (pkt->is_malformed) {
-        /* Counted in packets/bytes only, like the global counters. */
+    if (pkt->is_malformed || is_non_ip) {
+        /* Counted in packets/bytes only (no per-protocol bucket field). */
     } else if (pkt->proto == IPPROTO_TCP) {
         bucket->tcp_packets++;
         bucket->tcp_bytes += pkt->wire_len;

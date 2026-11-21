@@ -61,16 +61,30 @@ int cli_parse(int argc, char **argv, cli_config_t *cfg);
 /**
  * @brief Validate parsed config and prepare the environment.
  *
- * Checks that at least one input file is specified and readable
- * (@c access(..., R_OK)).  Creates the output directory
- * (@c mkdir(..., 0755), tolerating @c EEXIST).
+ * 1. At least one input file must be specified, and every input must be
+ *    readable (@c access(..., R_OK)).
+ * 2. Duplicate inputs - names that resolve to the same file (same device
+ *    and inode, i.e. the same @c realpath(), including symlinks and hard
+ *    links) - are removed from @p cfg, keeping the first occurrence, and
+ *    each one prints
+ *    `pcapstat: warning: skipping duplicate input '<dup>' (same file as
+ *    '<first>')` to stderr. Merging a file with itself would double every
+ *    counter. Removed strings are freed; @c input_count shrinks.
+ * 3. The output directory is created with all missing parents
+ *    (`mkdir -p` semantics, mode 0755). An existing directory is
+ *    accepted; an existing non-directory (e.g. a regular file) is an
+ *    error with a clear message.
  *
- * @param cfg  Parsed configuration (not modified).
+ * @param cfg  Parsed configuration; borrowed. @c input_files may be
+ *             compacted (duplicates freed), ownership is unchanged.
  * @return @c PCAPSTAT_OK on success,
- *         @c PCAPSTAT_ERR_ARGS if no inputs or a file is unreadable,
- *         @c PCAPSTAT_ERR_IO if the output directory cannot be created.
+ *         @c PCAPSTAT_ERR_ARGS if @p cfg is NULL, no inputs are given, an
+ *         input is unreadable, or the output directory string is empty,
+ *         @c PCAPSTAT_ERR_NOMEM on allocation failure,
+ *         @c PCAPSTAT_ERR_IO if the output path exists but is not a
+ *         directory, or a directory cannot be created or accessed.
  */
-int cli_validate_and_prepare(const cli_config_t *cfg);
+int cli_validate_and_prepare(cli_config_t *cfg);
 
 /**
  * @brief Print usage/help message to @p stream.

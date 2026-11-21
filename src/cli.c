@@ -130,8 +130,136 @@ int cli_parse(int argc, char **argv, cli_config_t *cfg)
     return PCAPSTAT_OK;
 }
 
-int cli_validate_and_prepare(const cli_config_t *cfg)
+/**
+ * Remove input_files[idx] (freeing it) and shift the tail down by one.
+ */
+static void remove_input_file(cli_config_t *cfg, size_t idx)
 {
+    free(cfg->input_files[idx]);
+    for (size_t j = idx + 1; j < cfg->input_count; j++)
+        cfg->input_files[j - 1] = cfg->input_files[j];
+    cfg->input_count--;
+    cfg->input_files[cfg->input_count] = NULL;
+}
+
+/**
+ * Drop inputs that name the same file as an earlier input (same device and
+ * inode, i.e. the same realpath(), also through symlinks or hard links).
+ * Merging a file with itself would double every counter and fabricate
+ * findings. Prints one warning per skipped duplicate.
+ */
+static int skip_duplicate_inputs(cli_config_t *cfg)
+{
+    size_t i = 0;
+    while (i < cfg->input_count) {
+        struct stat st_i;
+        if (stat(cfg->input_files[i], &st_i) != 0) {
+            fprintf(stderr, "pcapstat: cannot stat input file '%s': %s\n",
+                    cfg->input_files[i], strerror(errno));
+            return PCAPSTAT_ERR_ARGS;
+        }
+
+        size_t dup_of = i;
+        for (size_t k = 0; k < i; k++) {
+            struct stat st_k;
+            if (stat(cfg->input_files[k], &st_k) == 0 &&
+                st_k.st_dev == st_i.st_dev && st_k.st_ino == st_i.st_ino) {
+                dup_of = k;
+                break;
+            }
+        }
+        if (dup_of == i) {
+            i++;
+            continue;
+        }
+        fprintf(stderr,
+                "pcapstat: warning: skipping duplicate input '%s' (same file"
+                " as '%s')\n",
+                cfg->input_files[i], cfg->input_files[dup_of]);
+        remove_input_file(cfg, i);
+    }
+    return PCAPSTAT_OK;
+}
+
+/**
+ * mkdir -p: create @p path and every missing parent with mode 0755.
+ * Existing components are accepted only if they are directories.
+ */
+static int make_dirs(const char *path)
+{
+    size_t len = strlen(path);
+    char *buf = malloc(len + 1);
+    int rc = PCAPSTAT_OK;
+
+    if (!buf)
+        return PCAPSTAT_ERR_NOMEM;
+    memcpy(buf, path, len + 1);
+
+    /* Create each prefix ending before a '/' (skipping the root and
+     * repeated slashes), then the full path. */
+    for (size_t i = 1; i <= len; i++) {
+        if (i < len && (buf[i] != '/' || buf[i - 1] == '/'))
+            continue;
+        char saved = buf[i];
+        buf[i] = '\0';
+        if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+            fprintf(stderr,
+                    "pcapstat: cannot create output directory '%s': %s\n",
+                    buf, strerror(errno));
+            rc = PCAPSTAT_ERR_IO;
+            goto cleanup;
+        }
+        buf[i] = saved;
+    }
+
+cleanup:
+    free(buf);
+    return rc;
+}
+
+/**
+ * Ensure cfg->output_dir is a usable directory, creating it (and missing
+ * parents) if needed. An existing non-directory is a clear error instead
+ * of an opaque chart-writing failure later.
+ */
+static int prepare_output_dir(const char *dir)
+{
+    struct stat st;
+
+    if (dir == NULL || dir[0] == '\0') {
+        fprintf(stderr, "pcapstat: empty output directory\n");
+        return PCAPSTAT_ERR_ARGS;
+    }
+
+    if (stat(dir, &st) != 0) {
+        if (errno != ENOENT) {
+            fprintf(stderr, "pcapstat: cannot access output directory '%s': %s\n",
+                    dir, strerror(errno));
+            return PCAPSTAT_ERR_IO;
+        }
+        int rc = make_dirs(dir);
+        if (rc != PCAPSTAT_OK)
+            return rc;
+        if (stat(dir, &st) != 0) {
+            fprintf(stderr, "pcapstat: cannot access output directory '%s': %s\n",
+                    dir, strerror(errno));
+            return PCAPSTAT_ERR_IO;
+        }
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr,
+                "pcapstat: output path '%s' exists and is not a directory\n",
+                dir);
+        return PCAPSTAT_ERR_IO;
+    }
+    return PCAPSTAT_OK;
+}
+
+int cli_validate_and_prepare(cli_config_t *cfg)
+{
+    if (cfg == NULL)
+        return PCAPSTAT_ERR_ARGS;
     if (cfg->input_count == 0) {
         fprintf(stderr, "pcapstat: no input files specified\n");
         return PCAPSTAT_ERR_ARGS;
@@ -145,14 +273,11 @@ int cli_validate_and_prepare(const cli_config_t *cfg)
         }
     }
 
-    if (mkdir(cfg->output_dir, 0755) != 0 && errno != EEXIST) {
-        fprintf(stderr,
-                "pcapstat: cannot create output directory '%s': %s\n",
-                cfg->output_dir, strerror(errno));
-        return PCAPSTAT_ERR_IO;
-    }
+    int rc = skip_duplicate_inputs(cfg);
+    if (rc != PCAPSTAT_OK)
+        return rc;
 
-    return PCAPSTAT_OK;
+    return prepare_output_dir(cfg->output_dir);
 }
 
 void cli_print_usage(FILE *stream, const char *prog_name)

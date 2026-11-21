@@ -8,10 +8,15 @@
  *
  * Counting invariants (every ingested packet is counted exactly once in
  * the global category counters):
- *   tcp_packets + udp_packets + other_packets + malformed_packets
- *       == total_packets
+ *   tcp_packets + udp_packets + other_packets + non_ip_packets
+ *       + malformed_packets == total_packets
  * `other_packets` holds well-formed packets whose IP protocol is neither
  * TCP nor UDP (ICMP, GRE, ESP, IPv6 extension-header chains, ...).
+ * `non_ip_packets` holds frames whose link layer decoded fine but carries
+ * no IP (ARP, LLDP, STP, ...; parser flag `is_non_ip`).
+ * IPv4 non-first fragments (parser flag `is_fragment`) are counted in
+ * tcp/udp/other by their IP protocol AND in the informational
+ * `ip_fragments` counter (which is not part of the sum above).
  */
 
 #ifndef PCAPSTAT_STATS_H
@@ -56,13 +61,14 @@
  * `last_merged_sec - first_merged_sec + 1`. Consumers must compute rates
  * as `packets / span_sec` (not per bucket) to get a correct chart.
  *
- * `packets` and `bytes` include malformed packets; the per-protocol
- * fields do not (see the invariants in the file header). Packets without
- * a usable timestamp are in no bucket.
+ * `packets` and `bytes` include malformed and non-IP frames; the
+ * per-protocol fields do not (see the invariants in the file header).
+ * IPv4 fragments count in the per-protocol field of their IP protocol.
+ * Packets without a usable timestamp are in no bucket.
  *
  * `udp_packets_max` is the largest raw one-second UDP packet count among
- * the merged buckets; it is retained for burst detection after
- * downsampling.
+ * the merged buckets (informational; equals `udp_packets` for a raw
+ * bucket). Burst detection does not read it.
  */
 typedef struct {
     int64_t  sec;             /**< First second covered (epoch). */
@@ -88,7 +94,9 @@ typedef struct {
  *
  * The object is table-owned and is reachable only through @ref stats_ctx_t.
  * Created for every source and destination address of non-malformed IP
- * packets, so receive-only hosts get an entry too.
+ * packets (IPv4 fragments included), so receive-only hosts get an entry
+ * too. Fragments update only the tx/rx counters: their SYN/RST counters
+ * and probed ports are never touched, since they carry no L4 header.
  *
  * Ownership: a host may own a heap bitmap (`dst_ports_bitmap`), so host
  * objects are created and freed only by the stats module (stats_free()).
@@ -209,29 +217,42 @@ typedef struct {
  * and flow tables (with their payload objects, including promoted host
  * port bitmaps) and the timeline.
  *
- * `files_processed` is not touched by this module; the caller (main) must
- * increment it after each successfully processed file.
+ * `files_processed` and `truncated_files` are not touched by this module;
+ * the caller (main) must increment `files_processed` after each
+ * successfully processed file and `truncated_files` for each such file
+ * whose parser_file_info_t::truncated was set.
  *
  * Timestamps: a timestamp is "usable" if it is finite and its magnitude
  * is below 9.0e18 (so floor() fits in int64_t). Packets with unusable
  * timestamps are counted in all counters but are excluded from
  * first_ts/last_ts and from the time-series buckets.
  *
- * Hosts, ports and flows are filled only for non-malformed packets with
- * `ip_version != 0`; ports and flows only for TCP/UDP.
+ * Hosts, ports and flows are filled only for non-malformed, non-non-IP
+ * packets with `ip_version != 0`; ports and flows only for TCP/UDP that
+ * are not IPv4 non-first fragments. Fragments never reach the TCP flag
+ * counters, ports, flows, port-scan sets or retransmission analysis.
  */
 typedef struct {
     uint64_t files_processed;
+    uint64_t truncated_files;    /**< Input files whose read stopped early
+                                      on a truncated/corrupt record
+                                      (caller-maintained, see above). */
     uint64_t total_packets;
     uint64_t total_bytes;
     uint64_t tcp_packets;
     uint64_t tcp_bytes;
     uint64_t udp_packets;
     uint64_t udp_bytes;
-    uint64_t other_packets;      /**< Well-formed, non-TCP/UDP packets. */
+    uint64_t other_packets;      /**< Well-formed IP, non-TCP/UDP packets. */
+    uint64_t non_ip_packets;     /**< Well-formed L2 frames that carry no
+                                      IP (ARP, LLDP, STP, ...); counted in
+                                      no other category. */
     uint64_t malformed_packets;  /**< Parser-flagged; counted in no other
-                                      category (includes non-IP frames,
-                                      which the parser flags as malformed). */
+                                      category. */
+    uint64_t ip_fragments;       /**< IPv4 non-first fragments; also
+                                      counted in tcp/udp/other by proto
+                                      (informational, not in the
+                                      invariant sum). */
 
     double first_ts;             /**< Min usable timestamp (0 if none). */
     double last_ts;              /**< Max usable timestamp (0 if none). */
@@ -247,7 +268,8 @@ typedef struct {
 
     uint64_t packet_size_histogram[STATS_PACKET_SIZE_BINS];
 
-    /* TCP flag counters (non-malformed TCP packets only). */
+    /* TCP flag counters (non-malformed TCP packets that are not IPv4
+     * non-first fragments). */
     uint64_t syn;          /**< Pure SYN: SYN set and ACK clear. */
     uint64_t syn_ack;      /**< SYN and ACK both set. */
     uint64_t ack;          /**< ACK bit set (includes SYN+ACK). */

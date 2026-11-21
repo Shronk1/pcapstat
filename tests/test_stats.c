@@ -285,8 +285,132 @@ static void test_category_invariant(void)
     parsed_packet_t bad = make_packet(NAN, 60, IPPROTO_TCP);
     bad.is_malformed = true;
     CHECK(stats_update(&ctx, &bad) == PCAPSTAT_OK);
+    /* FIX-06: non-IP frames are their own category. */
+    parsed_packet_t arp = make_packet(1.0, 60, 0);
+    arp.is_non_ip = true;
+    CHECK(stats_update(&ctx, &arp) == PCAPSTAT_OK);
+    /* A fragment is counted by proto; ip_fragments is informational. */
+    parsed_packet_t frag = net_pkt(1.0, IPPROTO_UDP, 1, 2, 0, 0, 0, 60);
+    frag.is_fragment = true;
+    CHECK(stats_update(&ctx, &frag) == PCAPSTAT_OK);
+    CHECK(ctx.total_packets == 6);
+    CHECK(ctx.non_ip_packets == 1);
+    CHECK(ctx.malformed_packets == 1);
+    CHECK(ctx.ip_fragments == 1);
+    CHECK(ctx.udp_packets == 2);
     CHECK(ctx.tcp_packets + ctx.udp_packets + ctx.other_packets +
-              ctx.malformed_packets == ctx.total_packets);
+              ctx.non_ip_packets + ctx.malformed_packets ==
+          ctx.total_packets);
+    stats_free(&ctx);
+}
+
+/* H2 (stats side): a non-IP frame (ARP, LLDP, ...) is counted only in
+ * non_ip_packets and the bucket totals: not malformed, not "other IP", no
+ * hosts/ports/flows, even if a hand-built packet carries stray L3 data. */
+static void test_non_ip_frames_classified(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+    for (int i = 0; i < 4; ++i) {
+        parsed_packet_t p = net_pkt(5.0 + 0.1 * i, 0, 1, 2, 0, 0, 0, 60);
+        p.ip_version = (i == 0) ? 4 : 0; /* stray L3 info must be ignored */
+        p.is_non_ip = true;
+        send_pkt(&ctx, p);
+    }
+    CHECK(ctx.total_packets == 4);
+    CHECK(ctx.total_bytes == 240);
+    CHECK(ctx.non_ip_packets == 4);
+    CHECK(ctx.malformed_packets == 0);
+    CHECK(ctx.other_packets == 0);
+    CHECK(ctx.tcp_packets == 0 && ctx.udp_packets == 0);
+    CHECK(ht_count(ctx.hosts_ht) == 0);
+    CHECK(ht_count(ctx.ports_ht) == 0);
+    CHECK(ht_count(ctx.flows_ht) == 0);
+
+    CHECK(stats_finalize(&ctx) == PCAPSTAT_OK);
+    CHECK(ctx.timeline_count == 1);
+    CHECK(ctx.timeline[0].packets == 4);
+    CHECK(ctx.timeline[0].bytes == 240);
+    CHECK(ctx.timeline[0].other_packets == 0);
+    CHECK(ctx.timeline[0].tcp_packets == 0);
+    CHECK(ctx.timeline[0].udp_packets == 0);
+    stats_free(&ctx);
+}
+
+/* H3 (stats side): IPv4 non-first fragments count as TCP/UDP by proto and
+ * in ip_fragments, update host tx/rx, but never reach TCP flag counters,
+ * ports, flows, the port-scan set or retransmission tracking. Ports and
+ * flags are deliberately set to garbage here to prove they are ignored
+ * (the parser zeroes them; zero flags used to be a fake "Null Scan"). */
+static void test_fragments_skip_l4(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+
+    for (int i = 0; i < 30; ++i) {
+        parsed_packet_t p = net_pkt(1.0 + 0.01 * i, IPPROTO_UDP, 1, 2,
+                                    (uint16_t)(1000 + i), (uint16_t)(2000 + i),
+                                    0, 1000);
+        p.is_fragment = true;
+        send_pkt(&ctx, p);
+    }
+    const uint8_t tcp_flag_patterns[] = {
+        0, TH_FIN | TH_PUSH | TH_URG, TH_SYN | TH_FIN, TH_SYN | TH_RST, TH_SYN
+    };
+    for (size_t i = 0; i < sizeof(tcp_flag_patterns); ++i) {
+        parsed_packet_t p = net_pkt(2.0 + 0.01 * (double)i, IPPROTO_TCP, 3, 4,
+                                    (uint16_t)(3000 + i), (uint16_t)(80 + i),
+                                    tcp_flag_patterns[i], 500);
+        p.is_fragment = true;
+        p.tcp_seq = 1000;
+        p.payload_len = 100;
+        send_pkt(&ctx, p);
+        send_pkt(&ctx, p); /* would be a "retransmission" if tracked */
+    }
+
+    CHECK(ctx.total_packets == 40);
+    CHECK(ctx.ip_fragments == 40);
+    CHECK(ctx.udp_packets == 30 && ctx.udp_bytes == 30000);
+    CHECK(ctx.tcp_packets == 10 && ctx.tcp_bytes == 5000);
+    CHECK(ctx.other_packets == 0 && ctx.non_ip_packets == 0);
+    CHECK(ctx.syn == 0 && ctx.syn_ack == 0 && ctx.ack == 0);
+    CHECK(ctx.fin == 0 && ctx.rst == 0 && ctx.psh == 0 && ctx.urg == 0);
+    CHECK(ctx.null_scan_pkts == 0 && ctx.xmas_scan_pkts == 0);
+    CHECK(ctx.syn_fin_pkts == 0 && ctx.syn_rst_pkts == 0);
+    CHECK(ctx.tcp_retransmissions == 0 && ctx.tcp_out_of_order == 0);
+    CHECK(ht_count(ctx.ports_ht) == 0);
+    CHECK(ht_count(ctx.flows_ht) == 0);
+    CHECK(ht_count(ctx.hosts_ht) == 4);
+
+    const host_stats_t *h1 = find_host(&ctx, 1);
+    const host_stats_t *h2 = find_host(&ctx, 2);
+    const host_stats_t *h3 = find_host(&ctx, 3);
+    CHECK(h1 != NULL && h2 != NULL && h3 != NULL);
+    CHECK(h1->tx_packets == 30 && h1->tx_bytes == 30000);
+    CHECK(h2->rx_packets == 30 && h2->rx_bytes == 30000);
+    CHECK(h1->unique_dst_ports == 0 && h1->dst_ports_bitmap == NULL);
+    CHECK(h3->tx_packets == 10);
+    CHECK(h3->syn_sent == 0 && h3->rst_sent == 0);
+    CHECK(h3->unique_dst_ports == 0);
+
+    /* Buckets count fragments by proto, like the global counters. */
+    CHECK(stats_finalize(&ctx) == PCAPSTAT_OK);
+    CHECK(ctx.timeline_count == 2);
+    CHECK(ctx.timeline[0].udp_packets == 30);
+    CHECK(ctx.timeline[1].tcp_packets == 10);
+    stats_free(&ctx);
+}
+
+/* A first fragment (offset 0, MF set) is decoded normally by the parser
+ * and has is_fragment == false: its L4 header is real and still counted. */
+static void test_first_fragment_still_counted(void)
+{
+    stats_ctx_t ctx;
+    CHECK(stats_init(&ctx) == PCAPSTAT_OK);
+    send_pkt(&ctx, net_pkt(1.0, IPPROTO_TCP, 1, 2, 40000, 80, TH_SYN, 60));
+    CHECK(ctx.syn == 1 && ctx.ip_fragments == 0);
+    CHECK(ht_count(ctx.flows_ht) == 1 && ht_count(ctx.ports_ht) == 1);
+    CHECK(find_host(&ctx, 1)->unique_dst_ports == 1);
     stats_free(&ctx);
 }
 
@@ -1104,6 +1228,9 @@ int main(void)
     RUN(test_tcp_flag_counters);
     RUN(test_malformed_and_other);
     RUN(test_category_invariant);
+    RUN(test_non_ip_frames_classified);
+    RUN(test_fragments_skip_l4);
+    RUN(test_first_fragment_still_counted);
     RUN(test_timeline_contents_and_order);
     RUN(test_sparse_far_apart);
     RUN(test_non_finite_timestamps);
