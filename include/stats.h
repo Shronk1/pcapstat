@@ -8,10 +8,15 @@
  *
  * Counting invariants (every ingested packet is counted exactly once in
  * the global category counters):
- *   tcp_packets + udp_packets + other_packets + malformed_packets
- *       == total_packets
+ *   tcp_packets + udp_packets + other_packets + non_ip_packets
+ *       + malformed_packets == total_packets
  * `other_packets` holds well-formed packets whose IP protocol is neither
  * TCP nor UDP (ICMP, GRE, ESP, IPv6 extension-header chains, ...).
+ * `non_ip_packets` holds frames whose link layer decoded fine but carries
+ * no IP (ARP, LLDP, STP, ...; parser flag `is_non_ip`).
+ * IPv4 non-first fragments (parser flag `is_fragment`) are counted in
+ * tcp/udp/other by their IP protocol AND in the informational
+ * `ip_fragments` counter (which is not part of the sum above).
  */
 
 #ifndef PCAPSTAT_STATS_H
@@ -26,8 +31,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** @brief Number of fixed packet-size histogram bins. */
+/**
+ * @brief Number of fixed packet-size histogram bins.
+ *
+ * Bins are half-open ranges of wire length in bytes:
+ * `[0,64) [64,128) [128,256) [256,512) [512,1024) [1024,1514) [1514,inf)`,
+ * i.e. the chart labels `<64, 64-127, 128-255, 256-511, 512-1023,
+ * 1024-1513, >=1514`.
+ */
 #define STATS_PACKET_SIZE_BINS 7
+
+/**
+ * @brief Reordering window for TCP out-of-order classification, seconds.
+ *
+ * A payload segment that fills the recorded sequence hole less than this
+ * long after the segment that opened the hole is counted as out-of-order
+ * instead of as a retransmission (see flow_stats_t).
+ */
+#define STATS_OOO_WINDOW_SEC 0.003
 
 /**
  * @brief Aggregate statistics for a span of consecutive seconds.
@@ -40,13 +61,14 @@
  * `last_merged_sec - first_merged_sec + 1`. Consumers must compute rates
  * as `packets / span_sec` (not per bucket) to get a correct chart.
  *
- * `packets` and `bytes` include malformed packets; the per-protocol
- * fields do not (see the invariants in the file header). Packets without
- * a usable timestamp are in no bucket.
+ * `packets` and `bytes` include malformed and non-IP frames; the
+ * per-protocol fields do not (see the invariants in the file header).
+ * IPv4 fragments count in the per-protocol field of their IP protocol.
+ * Packets without a usable timestamp are in no bucket.
  *
  * `udp_packets_max` is the largest raw one-second UDP packet count among
- * the merged buckets; it is retained for burst detection after
- * downsampling.
+ * the merged buckets (informational; equals `udp_packets` for a raw
+ * bucket). Burst detection does not read it.
  */
 typedef struct {
     int64_t  sec;             /**< First second covered (epoch). */
@@ -61,15 +83,31 @@ typedef struct {
     uint64_t udp_packets_max;
 } ts_bucket_t;
 
-/** @brief Number of bytes in the fixed destination-port bitmap. */
+/** @brief Bytes in a promoted destination-port bitmap (65536 bits). */
 #define STATS_DST_PORT_BITMAP_BYTES 8192
+
+/** @brief Distinct probed ports a host stores inline before promotion. */
+#define STATS_HOST_INLINE_PORTS 16
 
 /**
  * @brief Aggregate traffic attributed to one IP host.
  *
  * The object is table-owned and is reachable only through @ref stats_ctx_t.
  * Created for every source and destination address of non-malformed IP
- * packets (so receive-only hosts get an entry, and its 8 KB bitmap, too).
+ * packets (IPv4 fragments included), so receive-only hosts get an entry
+ * too. Fragments update only the tx/rx counters: their SYN/RST counters
+ * and probed ports are never touched, since they carry no L4 header.
+ *
+ * Ownership: a host may own a heap bitmap (`dst_ports_bitmap`), so host
+ * objects are created and freed only by the stats module (stats_free()).
+ * Never free() a host_stats_t or copy one and free the copy.
+ *
+ * Probed-port set (compact): the first @ref STATS_HOST_INLINE_PORTS
+ * distinct ports are kept unsorted in `dst_ports_inline`. The next new
+ * port promotes the set to a lazily allocated
+ * @ref STATS_DST_PORT_BITMAP_BYTES bitmap; the inline array is then
+ * unused. Hosts that never probe (e.g. receive-only hosts) allocate no
+ * port storage: `dst_ports_bitmap` stays NULL.
  */
 typedef struct {
     uint8_t  ip_version; /**< IP version (4 or 6). */
@@ -85,7 +123,7 @@ typedef struct {
 
     /**
      * Distinct destination ports this host probed, for port-scan
-     * detection. A port is recorded (in one bitmap shared by TCP and UDP,
+     * detection. A port is recorded (in one set shared by TCP and UDP,
      * so TCP/80 and UDP/80 count once) when the host sends
      *  - a TCP pure SYN, or
      *  - a UDP datagram that is NOT a reply, i.e. no flow in the opposite
@@ -96,8 +134,15 @@ typedef struct {
      */
     uint32_t unique_dst_ports;
 
-    /** Bit p set = port p probed (byte p / 8, bit p % 8). */
-    uint8_t  dst_ports_bitmap[STATS_DST_PORT_BITMAP_BYTES];
+    /** Probed ports while `dst_ports_bitmap == NULL`: entries
+     *  `[0, unique_dst_ports)` are valid, distinct and unsorted. */
+    uint16_t dst_ports_inline[STATS_HOST_INLINE_PORTS];
+
+    /** NULL until more than @ref STATS_HOST_INLINE_PORTS distinct ports
+     *  were probed; then a host-owned @ref STATS_DST_PORT_BITMAP_BYTES
+     *  bitmap holding every probed port (bit p set = port p probed: byte
+     *  p / 8, bit p % 8). Freed by stats_free(). */
+    uint8_t *dst_ports_bitmap;
 } host_stats_t;
 
 /**
@@ -112,6 +157,30 @@ typedef struct {
 
 /**
  * @brief Aggregate statistics for one directional IPv4/IPv6 5-tuple.
+ *
+ * TCP sequence tracking (payload-bearing segments only, i.e.
+ * `payload_len > 0`; all comparisons are wrap-safe `(int32_t)` differences
+ * modulo 2^32). Let `end = seq + payload_len`:
+ *  - First segment, or a segment without a usable timestamp, or one whose
+ *    timestamp is earlier than `last_seq_ts` (e.g. merged files given out
+ *    of chronological order): **rebase** - `next_seq = end`, hole
+ *    cleared, `last_seq_ts` = its timestamp if usable. Not counted.
+ *  - `seq >= next_seq`: **new data**. If `seq > next_seq`, the gap
+ *    `[next_seq, seq)` is recorded as the hole (an unexpired hole is
+ *    extended to `seq` instead, so one interval covers all open gaps and
+ *    keeps its opening time). `next_seq = end`, `last_seq_ts` = now.
+ *  - Lying entirely inside the hole and arriving less than
+ *    @ref STATS_OOO_WINDOW_SEC after the segment that opened it:
+ *    **out_of_order**. The hole shrinks from the matching edge (cleared
+ *    when empty; a fill strictly in the middle leaves it unchanged).
+ *  - Anything else with `seq < next_seq`: **retransmission** (a
+ *    duplicate, a late fill of the hole, or a segment overlapping data
+ *    already seen). If it extends past `next_seq`, `next_seq = end` and
+ *    `last_seq_ts` = now.
+ *
+ * Limitation: SYN/FIN are not tracked, so the first data segment seen is
+ * the baseline; if the first two data segments arrive swapped, the
+ * earlier one has no recorded hole and counts as a retransmission.
  */
 typedef struct {
     uint8_t  ip_version; /**< IP version (4 or 6). */
@@ -127,9 +196,17 @@ typedef struct {
     uint8_t  tcp_flags_seen; /**< OR of all TCP flag bytes seen. */
     bool     has_timestamp;  /**< A usable timestamp was seen. */
     bool     has_seq;        /**< A TCP data segment was seen. */
-    uint32_t max_seq;        /**< Retransmission baseline; valid if has_seq. */
-    double   last_seq_ts;    /**< Time of the baseline; valid if has_seq. */
-    uint64_t retransmissions; /**< Candidate TCP retransmissions. */
+    bool     has_hole;       /**< hole_start/hole_end/hole_ts are valid. */
+    uint32_t next_seq;       /**< Highest seq + payload_len seen (after the
+                                  last rebase); valid if has_seq. */
+    uint32_t hole_start;     /**< First missing sequence number. */
+    uint32_t hole_end;       /**< One past the last missing number. */
+    double   hole_ts;        /**< Arrival time of the segment that opened
+                                  the hole. */
+    double   last_seq_ts;    /**< Time next_seq last advanced or was
+                                  rebased; valid if has_seq. */
+    uint64_t retransmissions; /**< TCP retransmissions (see above). */
+    uint64_t out_of_order;    /**< Reordered TCP segments (see above). */
 } flow_stats_t;
 
 /**
@@ -137,44 +214,62 @@ typedef struct {
  *
  * Caller allocates this struct, stats_init() initializes it, and
  * stats_free() releases everything it owns: the time-series, host, port
- * and flow tables (with their payload objects) and the timeline.
+ * and flow tables (with their payload objects, including promoted host
+ * port bitmaps) and the timeline.
  *
- * `files_processed` is not touched by this module; the caller (main) must
- * increment it after each successfully processed file.
+ * `files_processed` and `truncated_files` are not touched by this module;
+ * the caller (main) must increment `files_processed` after each
+ * successfully processed file and `truncated_files` for each such file
+ * whose parser_file_info_t::truncated was set.
  *
  * Timestamps: a timestamp is "usable" if it is finite and its magnitude
  * is below 9.0e18 (so floor() fits in int64_t). Packets with unusable
  * timestamps are counted in all counters but are excluded from
  * first_ts/last_ts and from the time-series buckets.
  *
- * Hosts, ports and flows are filled only for non-malformed packets with
- * `ip_version != 0`; ports and flows only for TCP/UDP.
+ * Hosts, ports and flows are filled only for non-malformed, non-non-IP
+ * packets with `ip_version != 0`; ports and flows only for TCP/UDP that
+ * are not IPv4 non-first fragments. Fragments never reach the TCP flag
+ * counters, ports, flows, port-scan sets or retransmission analysis.
  */
 typedef struct {
     uint64_t files_processed;
+    uint64_t truncated_files;    /**< Input files whose read stopped early
+                                      on a truncated/corrupt record
+                                      (caller-maintained, see above). */
     uint64_t total_packets;
     uint64_t total_bytes;
     uint64_t tcp_packets;
     uint64_t tcp_bytes;
     uint64_t udp_packets;
     uint64_t udp_bytes;
-    uint64_t other_packets;      /**< Well-formed, non-TCP/UDP packets. */
+    uint64_t other_packets;      /**< Well-formed IP, non-TCP/UDP packets. */
+    uint64_t non_ip_packets;     /**< Well-formed L2 frames that carry no
+                                      IP (ARP, LLDP, STP, ...); counted in
+                                      no other category. */
     uint64_t malformed_packets;  /**< Parser-flagged; counted in no other
-                                      category (includes non-IP frames,
-                                      which the parser flags as malformed). */
+                                      category. */
+    uint64_t ip_fragments;       /**< IPv4 non-first fragments; also
+                                      counted in tcp/udp/other by proto
+                                      (informational, not in the
+                                      invariant sum). */
 
     double first_ts;             /**< Min usable timestamp (0 if none). */
     double last_ts;              /**< Max usable timestamp (0 if none). */
-    double duration_sec;
-    double avg_pps;
-    double avg_bps;
+    double duration_sec;         /**< last_ts - first_ts, seconds. */
+    double avg_pps;              /**< total_packets / duration_sec,
+                                      packets per second. */
+    double avg_bps;              /**< 8 * total_bytes / duration_sec:
+                                      average wire bit rate in BITS per
+                                      second (not bytes). */
 
     /** Packets with a usable timestamp (denominator for first/last_ts). */
     uint64_t timestamped_packets;
 
     uint64_t packet_size_histogram[STATS_PACKET_SIZE_BINS];
 
-    /* TCP flag counters (non-malformed TCP packets only). */
+    /* TCP flag counters (non-malformed TCP packets that are not IPv4
+     * non-first fragments). */
     uint64_t syn;          /**< Pure SYN: SYN set and ACK clear. */
     uint64_t syn_ack;      /**< SYN and ACK both set. */
     uint64_t ack;          /**< ACK bit set (includes SYN+ACK). */
@@ -187,6 +282,10 @@ typedef struct {
     uint64_t xmas_scan_pkts;   /**< FIN+PSH+URG set, SYN clear. */
     uint64_t syn_fin_pkts;     /**< SYN and FIN both set. */
     uint64_t syn_rst_pkts;     /**< SYN and RST both set. */
+
+    /* TCP sequence analysis, over ALL flows (see flow_stats_t). */
+    uint64_t tcp_retransmissions; /**< Sum of flow_stats_t::retransmissions. */
+    uint64_t tcp_out_of_order;    /**< Sum of flow_stats_t::out_of_order. */
 
     ht_t *ts_buckets_ht;
     ts_bucket_t *timeline;
@@ -201,9 +300,10 @@ typedef struct {
  * @brief Map a protocol and port to a common service name.
  *
  * The returned string is static and must not be freed or modified.
- * Most names are protocol-independent; "UDP-Data" (9999) is UDP-only.
+ * All current names are protocol-independent (well-known IANA ports).
  *
- * @param proto IP protocol number.
+ * @param proto IP protocol number (currently unused; kept so names can
+ *        become protocol-specific without an API change).
  * @param port Destination port in host byte order.
  * @return ASCII service name, or "Unknown".
  */
@@ -271,7 +371,8 @@ int stats_init(stats_ctx_t *ctx);
  * @param pkt Borrowed packet populated by the parser.
  * @return PCAPSTAT_OK on success, PCAPSTAT_ERR_ARGS for NULL arguments or
  *         an uninitialized context, PCAPSTAT_ERR_NOMEM if an allocation
- *         or hash-table growth fails.
+ *         (including a host port-bitmap promotion) or hash-table growth
+ *         fails.
  */
 int stats_update(stats_ctx_t *ctx, const parsed_packet_t *pkt);
 
@@ -296,6 +397,8 @@ int stats_packet_cb(const parsed_packet_t *pkt, void *user_data);
  * (see ts_bucket_t). May be called repeatedly (e.g. after further
  * updates); the previous timeline is released before rebuilding.
  *
+ * Derived rates: `avg_pps = total_packets / duration_sec` and
+ * `avg_bps = 8 * total_bytes / duration_sec` (bits per second).
  * Division by zero is guarded: duration_sec, avg_pps and avg_bps are 0.0
  * when fewer than two distinct usable timestamps were seen.
  *
@@ -309,8 +412,10 @@ int stats_finalize(stats_ctx_t *ctx);
 /**
  * @brief Release every allocation owned by a statistics context.
  *
- * Frees all tables and their payload objects and the exported timeline,
- * then resets @p ctx. Pointers obtained from stats_top_*() become invalid.
+ * Frees all tables and their payload objects (host objects through the
+ * module's host destructor, which also frees a promoted port bitmap) and
+ * the exported timeline, then resets @p ctx. Pointers obtained from
+ * stats_top_*() become invalid.
  *
  * @param ctx Context to release; may be NULL.
  */

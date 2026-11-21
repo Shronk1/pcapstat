@@ -5,7 +5,8 @@
  * Tests cover: single/multiple -i flags, positional args, mixed inputs,
  * -o override, default output dir, --portscan-threshold (valid + invalid),
  * --help, --version, --verbose, unknown options, and cli_validate_and_prepare
- * (no inputs, unreadable file, successful creation of output directory).
+ * (no inputs, unreadable file, successful creation of output directory,
+ * mkdir -p of missing parents, -o naming a regular file, duplicate inputs).
  */
 
 #include "cli.h"
@@ -13,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* ── Minimal test harness ────────────────────────────────────────────── */
@@ -290,6 +292,131 @@ static int test_validate_existing_output_dir(void)
     return 1;
 }
 
+/* Scratch directory shared by the FIX-06 validation tests. */
+static int make_scratch(char *dir, size_t len)
+{
+    snprintf(dir, len, "/tmp/pcapstat_test_cli_XXXXXX");
+    return mkdtemp(dir) != NULL;
+}
+
+static int is_dir(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* -o naming an existing regular file must fail up front with ERR_IO
+ * (used to pass validation and fail later in chart generation). */
+static int test_validate_output_is_file(void)
+{
+    char dir[64], file[96];
+    TEST_ASSERT(make_scratch(dir, sizeof(dir)));
+    snprintf(file, sizeof(file), "%s/not_a_dir", dir);
+    FILE *f = fopen(file, "w");
+    TEST_ASSERT(f != NULL);
+    fclose(f);
+
+    cli_config_t cfg;
+    char *argv[] = { "pcapstat", "-i", "/dev/null", "-o", file, NULL };
+    TEST_ASSERT(cli_parse(5, argv, &cfg) == PCAPSTAT_OK);
+    int rc = cli_validate_and_prepare(&cfg);
+    cli_free(&cfg);
+
+    /* A path below the regular file cannot be created either. */
+    char below[128];
+    snprintf(below, sizeof(below), "%s/sub", file);
+    char *argv2[] = { "pcapstat", "-i", "/dev/null", "-o", below, NULL };
+    TEST_ASSERT(cli_parse(5, argv2, &cfg) == PCAPSTAT_OK);
+    int rc2 = cli_validate_and_prepare(&cfg);
+    cli_free(&cfg);
+
+    unlink(file);
+    rmdir(dir);
+    TEST_ASSERT(rc == PCAPSTAT_ERR_IO);
+    TEST_ASSERT(rc2 == PCAPSTAT_ERR_IO);
+    return 1;
+}
+
+/* mkdir -p semantics: every missing parent is created. */
+static int test_validate_creates_parents(void)
+{
+    char dir[64], a[80], ab[96], abc[112], abc_slash[128];
+    TEST_ASSERT(make_scratch(dir, sizeof(dir)));
+    snprintf(a, sizeof(a), "%s/a", dir);
+    snprintf(ab, sizeof(ab), "%s/b", a);
+    snprintf(abc, sizeof(abc), "%s/c", ab);
+    snprintf(abc_slash, sizeof(abc_slash), "%s//", abc);
+
+    cli_config_t cfg;
+    char *argv[] = { "pcapstat", "-i", "/dev/null", "-o", abc_slash, NULL };
+    TEST_ASSERT(cli_parse(5, argv, &cfg) == PCAPSTAT_OK);
+    int rc = cli_validate_and_prepare(&cfg);
+    cli_free(&cfg);
+    int created = is_dir(abc);
+
+    /* Running again on the now-existing tree is fine. */
+    char *argv2[] = { "pcapstat", "-i", "/dev/null", "-o", abc, NULL };
+    TEST_ASSERT(cli_parse(5, argv2, &cfg) == PCAPSTAT_OK);
+    int rc2 = cli_validate_and_prepare(&cfg);
+    cli_free(&cfg);
+
+    rmdir(abc);
+    rmdir(ab);
+    rmdir(a);
+    rmdir(dir);
+    TEST_ASSERT(rc == PCAPSTAT_OK);
+    TEST_ASSERT(created);
+    TEST_ASSERT(rc2 == PCAPSTAT_OK);
+    return 1;
+}
+
+/* The same file given twice (directly, via another spelling, or via a
+ * symlink) is kept once; order of first occurrences is preserved. */
+static int test_validate_duplicate_inputs(void)
+{
+    char dir[64], f1[96], f2[96], alias[112], link[96], outdir[96];
+    TEST_ASSERT(make_scratch(dir, sizeof(dir)));
+    snprintf(f1, sizeof(f1), "%s/one.pcap", dir);
+    snprintf(f2, sizeof(f2), "%s/two.pcap", dir);
+    snprintf(alias, sizeof(alias), "%s/./one.pcap", dir);
+    snprintf(link, sizeof(link), "%s/link.pcap", dir);
+    snprintf(outdir, sizeof(outdir), "%s/out", dir);
+    FILE *f = fopen(f1, "w");
+    TEST_ASSERT(f != NULL);
+    fclose(f);
+    f = fopen(f2, "w");
+    TEST_ASSERT(f != NULL);
+    fclose(f);
+    TEST_ASSERT(symlink(f1, link) == 0);
+
+    cli_config_t cfg;
+    char *argv[] = { "pcapstat", "-i", f1, "-i", f2, "-i", f1, "-i", alias,
+                     link, f2, "-o", outdir, NULL };
+    TEST_ASSERT(cli_parse(13, argv, &cfg) == PCAPSTAT_OK);
+    TEST_ASSERT(cfg.input_count == 6);
+    int rc = cli_validate_and_prepare(&cfg);
+    size_t count = cfg.input_count;
+    int order_ok = count == 2 && strcmp(cfg.input_files[0], f1) == 0 &&
+                   strcmp(cfg.input_files[1], f2) == 0;
+    cli_free(&cfg);
+
+    unlink(link);
+    unlink(f1);
+    unlink(f2);
+    rmdir(outdir);
+    rmdir(dir);
+    TEST_ASSERT(rc == PCAPSTAT_OK);
+    TEST_ASSERT(count == 2);
+    TEST_ASSERT(order_ok);
+    return 1;
+}
+
+static int test_validate_null(void)
+{
+    TEST_ASSERT(cli_validate_and_prepare(NULL) == PCAPSTAT_ERR_ARGS);
+    return 1;
+}
+
 /* ── Print-usage smoke test ──────────────────────────────────────────── */
 
 static int test_print_usage(void)
@@ -350,6 +477,10 @@ int main(void)
     RUN_TEST(test_validate_bad_file);
     RUN_TEST(test_validate_success);
     RUN_TEST(test_validate_existing_output_dir);
+    RUN_TEST(test_validate_output_is_file);
+    RUN_TEST(test_validate_creates_parents);
+    RUN_TEST(test_validate_duplicate_inputs);
+    RUN_TEST(test_validate_null);
 
     /* Usage / free tests */
     RUN_TEST(test_print_usage);

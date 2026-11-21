@@ -35,12 +35,46 @@
 #define REPORT_DEFAULT_FILENAME "report.pdf"
 
 /**
+ * @brief Format a capture duration for humans.
+ *
+ * Below one minute: `"12.34 s"`. Otherwise whole seconds as `"HH:MM:SS"`,
+ * prefixed with the day count once it reaches one day: `"3d 04:05:06"`.
+ * Negative or non-finite input is treated as 0.
+ *
+ * @param seconds Duration in seconds (e.g. stats_ctx_t::duration_sec).
+ * @param buf     Caller-owned output buffer; always NUL-terminated when
+ *                @p sz > 0 (truncated if too small; 32 bytes suffice).
+ * @param sz      Size of @p buf. Nothing is written if @p buf is NULL or
+ *                @p sz is 0.
+ */
+void report_format_duration(double seconds, char *buf, size_t sz);
+
+/**
+ * @brief Format a bit rate with a decimal SI unit.
+ *
+ * `"%.0f bps"` below 1000, `"%.1f kbps"` below 1e6, `"%.2f Mbps"` below
+ * 1e9, else `"%.2f Gbps"`. Negative or non-finite input is treated as 0.
+ *
+ * @param bits_per_sec Rate in BITS per second (stats_ctx_t::avg_bps).
+ * @param buf          Caller-owned output buffer; always NUL-terminated
+ *                     when @p sz > 0.
+ * @param sz           Size of @p buf. Nothing is written if @p buf is NULL
+ *                     or @p sz is 0.
+ */
+void report_format_bitrate(double bits_per_sec, char *buf, size_t sz);
+
+/**
  * @brief Generate a comprehensive multi-page PDF report.
  *
  * Emits an A4 (595 x 842 pt) multi-page PDF document containing:
- * - Page 1 (Executive Summary): Title, capture file list, generation metadata,
- *   and KPI cards/tables (packets, volume, duration, bitrates, protocol shares,
- *   active flows, and anomaly summary).
+ * - Page 1 (Executive Summary): Title, capture file list (`"(none)"` when
+ *   @p cfg lists no input files), generation metadata, and KPI cards/tables:
+ *   volume, duration (report_format_duration()), packet and bit rate
+ *   (report_format_bitrate()), protocol share, flows/hosts, anomaly summary,
+ *   and TCP health (global stats_ctx_t::tcp_retransmissions over all flows,
+ *   with out-of-order segments in the subtext). The protocol table has the
+ *   rows TCP, UDP, Other IP, Non-IP frames (ARP/LLDP/...), Malformed and
+ *   Total (the first five sum to Total, see the stats.h invariant).
  * - Page 2 (Traffic Characteristics): Zebra-striped tables for Top 10 IP
  *   Talkers, Top 10 Destination Ports & Services, and Top 10 Directional Flows.
  * - Page 3 (Visualizations): 2x2 grid directly embedding all 4 vector charts

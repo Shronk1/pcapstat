@@ -11,6 +11,7 @@
 #include "stats.h"
 
 #include <cairo.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -201,6 +202,114 @@ static void test_anomaly_pagination(void)
     stats_free(&stats);
 }
 
+/* FIX-06: human-readable duration instead of raw seconds. */
+static void test_format_duration(void)
+{
+    char buf[48];
+    report_format_duration(0.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "0.00 s") == 0);
+    report_format_duration(12.345, buf, sizeof(buf));
+    CHECK(strcmp(buf, "12.35 s") == 0 || strcmp(buf, "12.34 s") == 0);
+    report_format_duration(59.99, buf, sizeof(buf));
+    CHECK(strcmp(buf, "59.99 s") == 0);
+    report_format_duration(60.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "00:01:00") == 0);
+    report_format_duration(3725.9, buf, sizeof(buf));
+    CHECK(strcmp(buf, "01:02:05") == 0);
+    report_format_duration(86399.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "23:59:59") == 0);
+    report_format_duration(86400.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "1d 00:00:00") == 0);
+    /* 3 days, 4 h, 5 min, 6 s */
+    report_format_duration(3.0 * 86400.0 + 4 * 3600 + 5 * 60 + 6, buf,
+                           sizeof(buf));
+    CHECK(strcmp(buf, "3d 04:05:06") == 0);
+    /* INT32_MIN..INT32_MAX span (extreme timestamps) */
+    report_format_duration(4294967295.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "49710d 06:28:15") == 0);
+    /* Garbage in: clamped, never UB (strict UBSan in unit tests). */
+    report_format_duration(-5.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "0.00 s") == 0);
+    report_format_duration(NAN, buf, sizeof(buf));
+    CHECK(strcmp(buf, "0.00 s") == 0);
+    report_format_duration(1e300, buf, sizeof(buf));
+    CHECK(buf[0] != '\0' && strchr(buf, 'd') != NULL);
+    /* Small buffers stay NUL-terminated; NULL/0 are no-ops. */
+    char small[4];
+    report_format_duration(3725.0, small, sizeof(small));
+    CHECK(strcmp(small, "01:") == 0);
+    report_format_duration(1.0, NULL, 10);
+    report_format_duration(1.0, small, 0);
+}
+
+/* H4 display: avg_bps is bits/s; lowercase kbps, decimal SI units. */
+static void test_format_bitrate(void)
+{
+    char buf[32];
+    report_format_bitrate(0.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "0 bps") == 0);
+    report_format_bitrate(999.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "999 bps") == 0);
+    report_format_bitrate(1000.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "1.0 kbps") == 0);
+    report_format_bitrate(8.0 * 1500.0, buf, sizeof(buf)); /* 1500 B/s */
+    CHECK(strcmp(buf, "12.0 kbps") == 0);
+    report_format_bitrate(2.5e6, buf, sizeof(buf));
+    CHECK(strcmp(buf, "2.50 Mbps") == 0);
+    report_format_bitrate(1.25e9, buf, sizeof(buf));
+    CHECK(strcmp(buf, "1.25 Gbps") == 0);
+    report_format_bitrate(-1.0, buf, sizeof(buf));
+    CHECK(strcmp(buf, "0 bps") == 0);
+    report_format_bitrate(INFINITY, buf, sizeof(buf));
+    CHECK(strcmp(buf, "0 bps") == 0);
+}
+
+/* A report with every FIX-06 category populated (non-IP, fragments,
+ * truncated file, out-of-order) and no input files listed renders. */
+static void test_report_new_counters(void)
+{
+    cli_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg)); /* no inputs: sources show "(none)" */
+
+    stats_ctx_t stats;
+    CHECK(stats_init(&stats) == PCAPSTAT_OK);
+    parsed_packet_t p;
+    memset(&p, 0, sizeof(p));
+    p.timestamp = 1.0;
+    p.wire_len = 60;
+    p.is_non_ip = true;
+    CHECK(stats_update(&stats, &p) == PCAPSTAT_OK);
+    memset(&p, 0, sizeof(p));
+    p.timestamp = 3.0 * 86400.0;
+    p.wire_len = 1514;
+    p.ip_version = 4;
+    p.src_ip[0] = 10;
+    p.dst_ip[0] = 10;
+    p.dst_ip[3] = 2;
+    p.proto = 17;
+    p.is_fragment = true;
+    CHECK(stats_update(&stats, &p) == PCAPSTAT_OK);
+    stats.files_processed = 1;
+    stats.truncated_files = 1;
+    CHECK(stats_finalize(&stats) == PCAPSTAT_OK);
+    CHECK(stats.non_ip_packets == 1 && stats.ip_fragments == 1);
+
+    anomaly_list_t anomalies;
+    CHECK(anomaly_list_init(&anomalies) == PCAPSTAT_OK);
+    CHECK(anomaly_detect(&stats, NULL, &anomalies) == PCAPSTAT_OK);
+    CHECK(anomalies.count == 1);
+    CHECK(strcmp(anomalies.items[0].category, "Capture Integrity") == 0);
+
+    const char *out_pdf = "/tmp/test_report_fix06.pdf";
+    unlink(out_pdf);
+    CHECK(report_generate(&cfg, &stats, &anomalies, out_pdf) == PCAPSTAT_OK);
+    verify_pdf_file(out_pdf);
+    unlink(out_pdf);
+
+    anomaly_list_free(&anomalies);
+    stats_free(&stats);
+}
+
 #if defined(__SANITIZE_ADDRESS__) || defined(__has_feature)
 const char *__lsan_default_suppressions(void)
 {
@@ -216,6 +325,9 @@ int main(void)
     RUN(test_empty_stats_report);
     RUN(test_demo_pcap_report);
     RUN(test_anomaly_pagination);
+    RUN(test_format_duration);
+    RUN(test_format_bitrate);
+    RUN(test_report_new_counters);
     printf("All report generator tests PASSED.\n");
 
     cairo_debug_reset_static_data();

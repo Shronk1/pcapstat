@@ -91,10 +91,16 @@ typedef struct {
  * Safe helper macros
  * ------------------------------------------------------------------- */
 
-/** @brief Return the minimum of two values (evaluated once each). */
+/** @brief Return the minimum of two values.
+ *
+ * Function-like macro: the selected argument is evaluated twice, so do not
+ * pass expressions with side effects (e.g. `i++`). */
 #define PCAPSTAT_MIN(a, b) ((a) < (b) ? (a) : (b))
 
-/** @brief Return the maximum of two values (evaluated once each). */
+/** @brief Return the maximum of two values.
+ *
+ * Function-like macro: the selected argument is evaluated twice, so do not
+ * pass expressions with side effects (e.g. `i++`). */
 #define PCAPSTAT_MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /** @brief Number of elements in a statically-sized array. */

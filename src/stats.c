@@ -20,19 +20,20 @@ static bool ts_is_usable(double ts)
     return isfinite(ts) && fabs(ts) < STATS_TS_LIMIT;
 }
 
+/* Half-open bins matching the chart labels (see STATS_PACKET_SIZE_BINS). */
 static int histogram_bin(uint32_t size)
 {
-    if (size <= 64)
+    if (size < 64)
         return 0;
-    if (size <= 128)
+    if (size < 128)
         return 1;
-    if (size <= 256)
+    if (size < 256)
         return 2;
-    if (size <= 512)
+    if (size < 512)
         return 3;
-    if (size <= 1024)
+    if (size < 1024)
         return 4;
-    if (size <= 1500)
+    if (size < 1514)
         return 5;
     return 6;
 }
@@ -42,8 +43,21 @@ static void free_ts_bucket(void *value)
     free(value);
 }
 
+/* Host destructor: a host may own a promoted port bitmap. */
+static void free_host(void *value)
+{
+    host_stats_t *host = (host_stats_t *)value;
+
+    if (host == NULL)
+        return;
+    free(host->dst_ports_bitmap);
+    free(host);
+}
+
 const char *stats_port_service_name(uint8_t proto, uint16_t port)
 {
+    (void)proto; /* all current names are protocol-independent */
+
     switch (port) {
     case 20: return "FTP";
     case 21: return "FTP";
@@ -69,9 +83,6 @@ const char *stats_port_service_name(uint8_t proto, uint16_t port)
     case 5432: return "PostgreSQL";
     case 8080: return "HTTP-Alt";
     case 8081: return "HTTP-Alt";
-    case 9999:
-        /* Demo/test traffic only; meaningful for UDP. */
-        return proto == IPPROTO_UDP ? "UDP-Data" : "Unknown";
     default: return "Unknown";
     }
 }
@@ -295,7 +306,7 @@ int stats_init(stats_ctx_t *ctx)
     if (ctx->ts_buckets_ht == NULL || ctx->hosts_ht == NULL ||
         ctx->ports_ht == NULL || ctx->flows_ht == NULL) {
         ht_destroy(ctx->ts_buckets_ht, free_ts_bucket);
-        ht_destroy(ctx->hosts_ht, free);
+        ht_destroy(ctx->hosts_ht, free_host);
         ht_destroy(ctx->ports_ht, free);
         ht_destroy(ctx->flows_ht, free);
         memset(ctx, 0, sizeof(*ctx));
@@ -363,18 +374,55 @@ typedef struct {
     uint8_t proto;
 } flow_key_t;
 
-/* Record @p port in the host's bitmap; ports are counted once. */
-static void mark_dst_port(host_stats_t *host, uint16_t port)
+/* Set bit @p port (byte port / 8, bit port % 8); true if it was clear. */
+static bool bitmap_set(uint8_t *bitmap, uint16_t port)
+{
+    uint8_t *byte = &bitmap[(uint32_t)port / 8];
+    uint8_t bit = (uint8_t)(1U << (port % 8));
+    bool was_clear = (*byte & bit) == 0;
+
+    *byte |= bit;
+    return was_clear;
+}
+
+/*
+ * Record @p port in the host's compact port set; ports are counted once.
+ * Up to STATS_HOST_INLINE_PORTS distinct ports live in the inline array;
+ * the next new port promotes the set to a heap bitmap (see stats.h).
+ * Returns PCAPSTAT_ERR_NOMEM if the promotion allocation fails (the set
+ * and unique_dst_ports are then unchanged).
+ */
+static int mark_dst_port(host_stats_t *host, uint16_t port)
 {
     if (port == 0)
-        return;
+        return PCAPSTAT_OK;
 
-    uint32_t byte_index = (uint32_t)port / 8;
-    uint8_t bit = (uint8_t)(1U << (port % 8));
-    if ((host->dst_ports_bitmap[byte_index] & bit) == 0) {
-        host->dst_ports_bitmap[byte_index] |= bit;
-        host->unique_dst_ports++;
+    if (host->dst_ports_bitmap != NULL) {
+        if (bitmap_set(host->dst_ports_bitmap, port))
+            host->unique_dst_ports++;
+        return PCAPSTAT_OK;
     }
+
+    /* Inline mode: entries [0, unique_dst_ports) are valid. */
+    for (uint32_t i = 0; i < host->unique_dst_ports; ++i) {
+        if (host->dst_ports_inline[i] == port)
+            return PCAPSTAT_OK;
+    }
+    if (host->unique_dst_ports < STATS_HOST_INLINE_PORTS) {
+        host->dst_ports_inline[host->unique_dst_ports++] = port;
+        return PCAPSTAT_OK;
+    }
+
+    uint8_t *bitmap = (uint8_t *)calloc(1, STATS_DST_PORT_BITMAP_BYTES);
+    if (bitmap == NULL)
+        return PCAPSTAT_ERR_NOMEM;
+    for (uint32_t i = 0; i < host->unique_dst_ports; ++i)
+        (void)bitmap_set(bitmap, host->dst_ports_inline[i]);
+    (void)bitmap_set(bitmap, port);
+    memset(host->dst_ports_inline, 0, sizeof(host->dst_ports_inline));
+    host->dst_ports_bitmap = bitmap;
+    host->unique_dst_ports++;
+    return PCAPSTAT_OK;
 }
 
 /*
@@ -397,7 +445,13 @@ static bool udp_is_reply(stats_ctx_t *ctx, const parsed_packet_t *pkt)
     return ht_get(ctx->flows_ht, &rev, sizeof(rev)) != NULL;
 }
 
-static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt)
+/*
+ * Update source tx and destination rx counters. For an IPv4 non-first
+ * fragment (@p l4_absent) the ports and TCP flags are not real, so the
+ * SYN/RST counters and the probed-port set are left untouched.
+ */
+static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt,
+                       bool l4_absent)
 {
     host_key_t src_key;
     host_key_t dst_key;
@@ -423,7 +477,7 @@ static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt)
         memcpy(src->ip, pkt->src_ip, 16);
         if (ht_put(ctx->hosts_ht, &src_key, sizeof(src_key), src) !=
             PCAPSTAT_OK) {
-            free(src);
+            free_host(src);
             return PCAPSTAT_ERR_NOMEM;
         }
     }
@@ -439,13 +493,15 @@ static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt)
         memcpy(dst->ip, pkt->dst_ip, 16);
         if (ht_put(ctx->hosts_ht, &dst_key, sizeof(dst_key), dst) !=
             PCAPSTAT_OK) {
-            free(dst);
+            free_host(dst);
             return PCAPSTAT_ERR_NOMEM;
         }
     }
     dst->rx_packets++;
     dst->rx_bytes += pkt->wire_len;
 
+    if (l4_absent)
+        return PCAPSTAT_OK;
     if (pkt->proto == IPPROTO_TCP) {
         const uint8_t syn = (uint8_t)TH_SYN;
         const uint8_t ack = (uint8_t)TH_ACK;
@@ -453,7 +509,9 @@ static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt)
 
         if ((pkt->tcp_flags & syn) != 0 && (pkt->tcp_flags & ack) == 0) {
             src->syn_sent++;
-            mark_dst_port(src, pkt->dst_port);
+            int rc = mark_dst_port(src, pkt->dst_port);
+            if (rc != PCAPSTAT_OK)
+                return rc;
         }
         if ((pkt->tcp_flags & (syn | ack)) == (syn | ack))
             dst->syn_ack_recv++;
@@ -463,7 +521,7 @@ static int update_host(stats_ctx_t *ctx, const parsed_packet_t *pkt)
         }
     } else if (pkt->proto == IPPROTO_UDP) {
         if (!udp_is_reply(ctx, pkt))
-            mark_dst_port(src, pkt->dst_port);
+            return mark_dst_port(src, pkt->dst_port);
     }
     return PCAPSTAT_OK;
 }
@@ -494,6 +552,80 @@ static int update_port(stats_ctx_t *ctx, const parsed_packet_t *pkt)
     port->packets++;
     port->bytes += pkt->wire_len;
     return PCAPSTAT_OK;
+}
+
+/* Wrap-safe signed distance a - b in TCP sequence space (mod 2^32). */
+static int32_t seq_diff(uint32_t a, uint32_t b)
+{
+    return (int32_t)(a - b);
+}
+
+/*
+ * Classify one payload-bearing TCP segment of @p flow as new data,
+ * out-of-order or retransmission (rules documented at flow_stats_t) and
+ * keep the global counters equal to the per-flow sums.
+ */
+static void track_tcp_seq(stats_ctx_t *ctx, flow_stats_t *flow,
+                          const parsed_packet_t *pkt)
+{
+    const double ts = pkt->timestamp;
+    const bool ts_ok = ts_is_usable(ts);
+    const uint32_t seq = pkt->tcp_seq;
+    const uint32_t end = seq + pkt->payload_len;
+
+    /* Rebase: first segment, no usable time, or a timestamp before the
+     * baseline (e.g. files merged out of chronological order). */
+    if (!flow->has_seq || !ts_ok || ts < flow->last_seq_ts) {
+        flow->has_seq = true;
+        flow->has_hole = false;
+        flow->next_seq = end;
+        if (ts_ok)
+            flow->last_seq_ts = ts;
+        return;
+    }
+
+    /* A hole older than the reordering window can only be filled by a
+     * retransmission; forget it. ts >= last_seq_ts >= hole_ts here. */
+    if (flow->has_hole && ts - flow->hole_ts >= STATS_OOO_WINDOW_SEC)
+        flow->has_hole = false;
+
+    const int32_t ahead = seq_diff(seq, flow->next_seq);
+    if (ahead >= 0) {
+        /* New data. A gap before it opens (or extends) the hole. */
+        if (ahead > 0) {
+            if (!flow->has_hole) {
+                flow->has_hole = true;
+                flow->hole_start = flow->next_seq;
+                flow->hole_ts = ts;
+            }
+            flow->hole_end = seq;
+        }
+        flow->next_seq = end;
+        flow->last_seq_ts = ts;
+        return;
+    }
+
+    if (flow->has_hole && seq_diff(seq, flow->hole_start) >= 0 &&
+        seq_diff(end, flow->hole_end) <= 0) {
+        /* Fills (part of) the hole within the window: reordering. */
+        flow->out_of_order++;
+        ctx->tcp_out_of_order++;
+        if (seq == flow->hole_start)
+            flow->hole_start = end;
+        else if (end == flow->hole_end)
+            flow->hole_end = seq;
+        if (seq_diff(flow->hole_end, flow->hole_start) <= 0)
+            flow->has_hole = false;
+        return;
+    }
+
+    /* Starts below next_seq and is not a timely hole fill. */
+    flow->retransmissions++;
+    ctx->tcp_retransmissions++;
+    if (seq_diff(end, flow->next_seq) > 0) {
+        flow->next_seq = end;
+        flow->last_seq_ts = ts;
+    }
 }
 
 static int update_flow(stats_ctx_t *ctx, const parsed_packet_t *pkt)
@@ -549,20 +681,8 @@ static int update_flow(stats_ctx_t *ctx, const parsed_packet_t *pkt)
     flow->bytes += pkt->wire_len;
     if (pkt->proto == IPPROTO_TCP) {
         flow->tcp_flags_seen |= pkt->tcp_flags;
-        if (pkt->payload_len > 0) {
-            /* Wrap-safe modular comparison: seq <= max_seq. */
-            if (flow->has_seq &&
-                ts_is_usable(pkt->timestamp) &&
-                pkt->timestamp >= flow->last_seq_ts &&
-                (int32_t)(pkt->tcp_seq - flow->max_seq) <= 0) {
-                flow->retransmissions++;
-            } else {
-                flow->max_seq = pkt->tcp_seq;
-                flow->last_seq_ts =
-                    ts_is_usable(pkt->timestamp) ? pkt->timestamp : 0.0;
-            }
-            flow->has_seq = true;
-        }
+        if (pkt->payload_len > 0)
+            track_tcp_seq(ctx, flow, pkt);
     }
     return PCAPSTAT_OK;
 }
@@ -594,28 +714,44 @@ int stats_update(stats_ctx_t *ctx, const parsed_packet_t *pkt)
     }
 
     /* Exactly one category per packet:
-     * malformed | tcp | udp | other (see invariants in stats.h). */
+     * malformed | non_ip | tcp | udp | other (see invariants in stats.h).
+     * IPv4 non-first fragments count in tcp/udp/other by proto (plus the
+     * informational ip_fragments), but carry no L4 header, so they never
+     * touch the TCP flag counters, ports, flows or port-scan sets. */
+    const bool is_non_ip = !pkt->is_malformed && pkt->is_non_ip;
+    const bool is_fragment =
+        !pkt->is_malformed && !is_non_ip && pkt->is_fragment;
+
     if (pkt->is_malformed) {
         ctx->malformed_packets++;
+    } else if (is_non_ip) {
+        ctx->non_ip_packets++;
     } else if (pkt->proto == IPPROTO_TCP) {
         ctx->tcp_packets++;
         ctx->tcp_bytes += pkt->wire_len;
-        update_tcp_flags(ctx, pkt->tcp_flags);
+        if (!is_fragment)
+            update_tcp_flags(ctx, pkt->tcp_flags);
     } else if (pkt->proto == IPPROTO_UDP) {
         ctx->udp_packets++;
         ctx->udp_bytes += pkt->wire_len;
     } else {
         ctx->other_packets++;
     }
+    if (is_fragment)
+        ctx->ip_fragments++;
 
     /* Hosts/ports/flows need a decoded L3 header. The parser always sets
-     * ip_version for non-malformed packets; the check keeps hand-built
-     * packets (tests) from collapsing into one all-zero flow. */
-    if (!pkt->is_malformed && pkt->ip_version != 0) {
-        int rc = update_host(ctx, pkt);
+     * ip_version for IP packets that are not malformed; the check keeps
+     * hand-built packets (tests) from collapsing into one all-zero flow.
+     * Fragments update host tx/rx only (update_host() skips their L4). */
+    if (!pkt->is_malformed && !is_non_ip && pkt->ip_version != 0) {
+        int rc = update_host(ctx, pkt, is_fragment);
         if (rc != PCAPSTAT_OK)
             return rc;
-        rc = update_port(ctx, pkt);
+    }
+    if (!pkt->is_malformed && !is_non_ip && !is_fragment &&
+        pkt->ip_version != 0) {
+        int rc = update_port(ctx, pkt);
         if (rc != PCAPSTAT_OK)
             return rc;
         rc = update_flow(ctx, pkt);
@@ -644,8 +780,8 @@ int stats_update(stats_ctx_t *ctx, const parsed_packet_t *pkt)
 
     bucket->packets++;
     bucket->bytes += pkt->wire_len;
-    if (pkt->is_malformed) {
-        /* Counted in packets/bytes only, like the global counters. */
+    if (pkt->is_malformed || is_non_ip) {
+        /* Counted in packets/bytes only (no per-protocol bucket field). */
     } else if (pkt->proto == IPPROTO_TCP) {
         bucket->tcp_packets++;
         bucket->tcp_bytes += pkt->wire_len;
@@ -774,8 +910,9 @@ int stats_finalize(stats_ctx_t *ctx)
         if (ctx->duration_sec > 0.0) {
             ctx->avg_pps =
                 (double)ctx->total_packets / ctx->duration_sec;
+            /* Bits per second (the report prints kbps/Mbps). */
             ctx->avg_bps =
-                (double)ctx->total_bytes / ctx->duration_sec;
+                8.0 * (double)ctx->total_bytes / ctx->duration_sec;
         }
     }
 
@@ -788,7 +925,7 @@ void stats_free(stats_ctx_t *ctx)
         return;
 
     ht_destroy(ctx->ts_buckets_ht, free_ts_bucket);
-    ht_destroy(ctx->hosts_ht, free);
+    ht_destroy(ctx->hosts_ht, free_host);
     ht_destroy(ctx->ports_ht, free);
     ht_destroy(ctx->flows_ht, free);
     free(ctx->timeline);
