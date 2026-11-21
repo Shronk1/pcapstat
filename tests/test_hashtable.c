@@ -30,6 +30,24 @@ static uint64_t ref_fnv1a(const void *key, size_t len)
     return h;
 }
 
+/* Independent reference murmur3 fmix64 finalizer. */
+static uint64_t ref_fmix64(uint64_t h)
+{
+    h ^= h >> 33;
+    h *= UINT64_C(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h *= UINT64_C(0xc4ceb9fe1a85ec53);
+    h ^= h >> 33;
+    return h;
+}
+
+/* Expected bucket: fmix64(FNV-1a(key)) & (capacity - 1). */
+static size_t ref_bucket(const void *key, size_t len, size_t capacity)
+{
+    return (size_t)(ref_fmix64(ref_fnv1a(key, len)) &
+                    (uint64_t)(capacity - 1));
+}
+
 static bool is_pow2(size_t x)
 {
     return x != 0 && (x & (x - 1)) == 0;
@@ -326,15 +344,66 @@ static void test_fnv1a_bucket_placement(void)
     CHECK(ref_fnv1a("a", 1) == UINT64_C(0xaf63dc4c8601ec8c));
     CHECK(ref_fnv1a("foobar", 6) == UINT64_C(0x85944171f73967e8));
 
-    /* the library must place keys where FNV-1a & (cap-1) says */
+    /* official murmur3 fmix64 reference values */
+    CHECK(ref_fmix64(0) == 0);
+    CHECK(ref_fmix64(1) == UINT64_C(0xb456bcfc34c2cb2c));
+
+    /* the library must place keys where fmix64(FNV-1a) & (cap-1) says */
     CHECK(ht_put(ht, "a", 1, &v) == PCAPSTAT_OK);
-    idx = (size_t)(ref_fnv1a("a", 1) & (uint64_t)(ht->capacity - 1));
+    idx = ref_bucket("a", 1, ht->capacity);
     CHECK(ht->buckets[idx] != NULL);
     CHECK(ht->buckets[idx]->key_len == 1);
     CHECK(memcmp(ht->buckets[idx]->key, "a", 1) == 0);
 
     ht_destroy(ht, NULL);
-    printf("  FNV-1a placement: PASS\n");
+    printf("  FNV-1a + fmix64 placement: PASS\n");
+}
+
+/*
+ * Regression: the low 4 bits of raw FNV-1a depend only on the low 4 bits
+ * of every key byte, so keys that differ only in a high nibble (IPv4
+ * 10.0.0.0, .16, .32, ...) all landed in ONE bucket of a 16-bucket table.
+ * With the fmix64 finalizer they must spread out.
+ */
+static void test_high_bit_keys_spread(void)
+{
+    enum { N = 8 };                          /* < 0.7 * 16: no growth */
+    unsigned char keys[N][4];
+    int vals[N];
+    ht_t *ht = ht_create(16);
+    size_t used = 0, longest = 0;
+
+    CHECK(ht != NULL);
+    for (int i = 0; i < N; ++i) {
+        keys[i][0] = 10;
+        keys[i][1] = 0;
+        keys[i][2] = 0;
+        keys[i][3] = (unsigned char)(i << 4);
+        vals[i] = i;
+        /* precondition: raw FNV-1a really collides on the low 4 bits */
+        CHECK((ref_fnv1a(keys[i], 4) & 15u) == (ref_fnv1a(keys[0], 4) & 15u));
+        CHECK(ht_put(ht, keys[i], 4, &vals[i]) == PCAPSTAT_OK);
+    }
+    CHECK(ht->capacity == 16);
+
+    for (size_t b = 0; b < ht->capacity; ++b) {
+        size_t len = 0;
+
+        for (ht_entry_t *e = ht->buckets[b]; e != NULL; e = e->next)
+            len++;
+        if (len > 0)
+            used++;
+        if (len > longest)
+            longest = len;
+    }
+    CHECK(used >= 4);                        /* old code: used == 1 */
+    CHECK(longest <= 3);                     /* old code: longest == 8 */
+    for (int i = 0; i < N; ++i)
+        CHECK(ht_get(ht, keys[i], 4) == &vals[i]);
+
+    ht_destroy(ht, NULL);
+    printf("  high-bit keys spread (%zu buckets, longest chain %zu): PASS\n",
+           used, longest);
 }
 
 static void test_collision_chain(void)
@@ -347,7 +416,7 @@ static void test_collision_chain(void)
     unsigned extra = 4000000000u;            /* the 12th insert triggers growth */
 
     for (unsigned c = 0; n < CHAIN && c < 1000000u; ++c) {
-        if ((ref_fnv1a(&c, sizeof(c)) & 15u) == TARGET_BUCKET)
+        if (ref_bucket(&c, sizeof(c), 16) == TARGET_BUCKET)
             keys[n++] = c;
     }
     CHECK(n == CHAIN);
@@ -490,6 +559,7 @@ int main(void)
     test_overwrite_does_not_grow();
     test_load_factor_invariant();
     test_fnv1a_bucket_placement();
+    test_high_bit_keys_spread();
     test_collision_chain();
     test_iterator_out_params();
     test_large_table();

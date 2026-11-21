@@ -28,9 +28,25 @@ static uint64_t ht_hash(const void *key, size_t key_len)
     return hash;
 }
 
+/*
+ * murmur3 fmix64 finalizer. The low k bits of FNV-1a depend only on the
+ * low k bits of each key byte, so masking it directly maps keys that differ
+ * only in high bits (e.g. 10.0.0.16 / .32 / .48 in a 16-bucket table) to
+ * one bucket. Keys come from untrusted captures; mix before masking.
+ */
+static uint64_t ht_mix64(uint64_t h)
+{
+    h ^= h >> 33;
+    h *= UINT64_C(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h *= UINT64_C(0xc4ceb9fe1a85ec53);
+    h ^= h >> 33;
+    return h;
+}
+
 static size_t ht_bucket_index(uint64_t hash, size_t capacity)
 {
-    return (size_t)(hash & (uint64_t)(capacity - 1));
+    return (size_t)(ht_mix64(hash) & (uint64_t)(capacity - 1));
 }
 
 static ht_entry_t *ht_find(const ht_t *ht, const void *key, size_t key_len)
