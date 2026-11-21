@@ -8,7 +8,10 @@
 #include "stats.h"
 
 #include <cairo.h>
+#include <inttypes.h>
 #include <math.h>
+#include <netinet/in.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,16 +68,25 @@
 #define COLOR_HIST_G        0.27
 #define COLOR_HIST_B        0.90
 
+/* Number of bars in the TCP flag chart: 7 flags + "Suspicious". */
+#define TCP_FLAG_BARS 8
+
 /* TCP Flag Palette */
-static const double TCP_FLAG_COLORS[7][3] = {
+static const double TCP_FLAG_COLORS[TCP_FLAG_BARS][3] = {
     {0.15, 0.39, 0.92}, /* SYN: Blue */
     {0.39, 0.40, 0.95}, /* SYN-ACK: Indigo */
     {0.06, 0.73, 0.51}, /* ACK: Emerald */
     {0.96, 0.62, 0.04}, /* FIN: Amber */
     {0.94, 0.27, 0.27}, /* RST: Red */
     {0.55, 0.36, 0.96}, /* PSH: Purple */
-    {0.93, 0.28, 0.60}  /* URG: Pink */
+    {0.93, 0.28, 0.60}, /* URG: Pink */
+    {0.70, 0.05, 0.10}  /* Suspicious: Dark red */
 };
+
+/* Largest time offset (seconds) the X-axis formatter prints. Below 2^64,
+ * so converting the rounded value to uint64_t is always defined. Bucket
+ * seconds lie within about +/-9e18 (see stats.h), so real spans fit. */
+#define TIME_LABEL_MAX_SEC 1.8e19
 
 /* -------------------------------------------------------------------
  * Formatting and Drawing Helpers
@@ -102,6 +114,116 @@ static void format_metric(char *buf, size_t sz, double val)
     } else {
         snprintf(buf, sz, "%.0f", val);
     }
+}
+
+/**
+ * @brief Format a value-axis tick label.
+ *
+ * Ticks are axis_max * k / 4 with axis_max in {1, 2, 2.5, 5} * 10^n, so
+ * they can be fractional (0.25, 2.5, 12.5, ...); "%.0f" would print the
+ * ticks of a 0..1 axis as "0 0 0 1 1" and 2.5 as "2". Below 1000 the
+ * value is therefore printed with %g: exact for quarter ticks, integers
+ * stay integers (no trailing ".0"), so every axis whose maximum is < 10
+ * gets decimals. From 1000 up the compact metric format is kept.
+ */
+static void format_axis_tick(char *buf, size_t sz, double val)
+{
+    if (!(val > 0.0)) {
+        val = 0.0;
+    }
+    if (val < 1000.0) {
+        snprintf(buf, sz, "%g", val);
+    } else {
+        format_metric(buf, sz, val);
+    }
+}
+
+/**
+ * @brief Round @p sec to the nearest whole @p unit, clamped to
+ *        [0, TIME_LABEL_MAX_SEC / unit] (NaN and negatives give 0).
+ */
+static uint64_t round_time_units(double sec, double unit)
+{
+    if (!(sec > 0.0)) {
+        return 0;
+    }
+    double v = floor(sec / unit + 0.5);
+    double cap = floor(TIME_LABEL_MAX_SEC / unit);
+    if (!(v < cap)) {
+        v = cap;
+    }
+    return (uint64_t)v;
+}
+
+/**
+ * @brief Format an offset from the start of the capture as an X-axis label.
+ *
+ * The unit depends on the whole axis span (not on the tick value), so all
+ * ticks of one axis share a format:
+ *   span < 60 s   "+12s", "+2.5s"  (%g: exact for quarter ticks)
+ *   span < 1 h    "+05:30"         (minutes:seconds)
+ *   span < 1 d    "+3h05m"
+ *   otherwise     "+2d04h"
+ * From one minute up, values are rounded to the displayed unit and
+ * clamped, so any span that fits in int64_t seconds yields a
+ * non-negative, untruncated label.
+ */
+static void format_time_offset(char *buf, size_t sz, double offset_sec,
+                               double span_sec)
+{
+    if (!(offset_sec > 0.0)) {
+        offset_sec = 0.0;
+    }
+
+    if (span_sec < 60.0) {
+        if (offset_sec > span_sec) {
+            offset_sec = span_sec;
+        }
+        snprintf(buf, sz, "+%gs", offset_sec);
+    } else if (span_sec < 3600.0) {
+        uint64_t s = round_time_units(offset_sec, 1.0);
+        snprintf(buf, sz, "+%02" PRIu64 ":%02u", s / 60, (unsigned)(s % 60));
+    } else if (span_sec < 86400.0) {
+        uint64_t m = round_time_units(offset_sec, 60.0);
+        snprintf(buf, sz, "+%" PRIu64 "h%02um", m / 60, (unsigned)(m % 60));
+    } else {
+        uint64_t h = round_time_units(offset_sec, 3600.0);
+        snprintf(buf, sz, "+%" PRIu64 "d%02uh", h / 24, (unsigned)(h % 24));
+    }
+}
+
+/**
+ * @brief Format a port bar label as "<port>/<proto> (<service>)",
+ *        e.g. "53/udp (DNS)".
+ *
+ * TCP and UDP ports with the same number are separate bars, so the
+ * protocol must be part of the label.
+ */
+static void format_port_label(char *buf, size_t sz, const port_stats_t *p)
+{
+    const char *svc = stats_port_service_name(p->proto, p->dst_port);
+
+    if (p->proto == IPPROTO_TCP) {
+        snprintf(buf, sz, "%u/tcp (%s)", (unsigned)p->dst_port, svc);
+    } else if (p->proto == IPPROTO_UDP) {
+        snprintf(buf, sz, "%u/udp (%s)", (unsigned)p->dst_port, svc);
+    } else {
+        snprintf(buf, sz, "%u/%u (%s)", (unsigned)p->dst_port,
+                 (unsigned)p->proto, svc);
+    }
+}
+
+/**
+ * @brief Restore the caller's Cairo state and report the context status.
+ *
+ * @return PCAPSTAT_OK, or PCAPSTAT_ERR_RENDER if the context is in an
+ *         error state (an error during drawing, or already on entry).
+ */
+static int finish_draw(cairo_t *cr)
+{
+    cairo_restore(cr);
+    return (cairo_status(cr) == CAIRO_STATUS_SUCCESS) ? PCAPSTAT_OK
+                                                      : PCAPSTAT_ERR_RENDER;
 }
 
 /**
@@ -207,6 +329,115 @@ static void draw_empty_placeholder(cairo_t *cr, double x, double y,
 }
 
 /* -------------------------------------------------------------------
+ * Timeline Geometry Helpers
+ * ------------------------------------------------------------------- */
+
+/** Plot area and axis scales of the traffic timeline. */
+typedef struct {
+    double  x, y, w, h;  /* plot area */
+    int64_t t_start;     /* first second on the X axis */
+    double  t_total;     /* seconds covered by the X axis (> 0) */
+    double  y_max;       /* packet rate at the top of the Y axis (> 0) */
+} timeline_axes_t;
+
+/**
+ * @brief Seconds from @p t0 to @p sec (0 if sec <= t0).
+ *
+ * Bucket seconds may lie anywhere in about +/-9e18, so the signed
+ * difference can exceed INT64_MAX; the unsigned difference is exact.
+ */
+static double sec_offset(int64_t sec, int64_t t0)
+{
+    if (sec <= t0) {
+        return 0.0;
+    }
+    return (double)((uint64_t)sec - (uint64_t)t0);
+}
+
+/** Seconds covered by a bucket (span_sec, at least 1). */
+static uint64_t bucket_span(const ts_bucket_t *b)
+{
+    return (b->span_sec > 0) ? b->span_sec : 1;
+}
+
+/** True if @p cur does not start where @p prev ends (no traffic between). */
+static bool bucket_gap_before(const ts_bucket_t *prev, const ts_bucket_t *cur)
+{
+    if (cur->sec <= prev->sec) {
+        return false;
+    }
+    return (uint64_t)cur->sec - (uint64_t)prev->sec > bucket_span(prev);
+}
+
+/** Map a capture-relative time to an X coordinate inside the plot. */
+static double timeline_px(const timeline_axes_t *ax, double t)
+{
+    double px = ax->x + (t / ax->t_total) * ax->w;
+    if (px < ax->x) px = ax->x;
+    if (px > ax->x + ax->w) px = ax->x + ax->w;
+    return px;
+}
+
+/** Map a packet rate to a Y coordinate inside the plot. */
+static double timeline_py(const timeline_axes_t *ax, double rate)
+{
+    double py = ax->y + ax->h - (rate / ax->y_max) * ax->h;
+    if (py < ax->y) py = ax->y;
+    if (py > ax->y + ax->h) py = ax->y + ax->h;
+    return py;
+}
+
+/**
+ * @brief Stroke the TCP or UDP packet-rate series of the timeline.
+ *
+ * Consecutive buckets are joined at their midpoints. Across a gap between
+ * buckets (no packets seen) the line drops to 0 at the end of the previous
+ * bucket and rises from 0 at the start of the next one, instead of
+ * interpolating a rate that never existed. A lone bucket (a single point)
+ * is drawn as a flat segment over its span so it stays visible.
+ */
+static void stroke_rate_series(cairo_t *cr, const stats_ctx_t *stats,
+                               const timeline_axes_t *ax, bool udp)
+{
+    double base_y = ax->y + ax->h;
+
+    if (stats->timeline_count == 1) {
+        const ts_bucket_t *b = &stats->timeline[0];
+        double span = (double)bucket_span(b);
+        double pkts = (double)(udp ? b->udp_packets : b->tcp_packets);
+        double py = timeline_py(ax, pkts / span);
+        cairo_move_to(cr, timeline_px(ax, 0.0), py);
+        cairo_line_to(cr, timeline_px(ax, span), py);
+        cairo_stroke(cr);
+        return;
+    }
+
+    for (size_t i = 0; i < stats->timeline_count; i++) {
+        const ts_bucket_t *b = &stats->timeline[i];
+        double span = (double)bucket_span(b);
+        double pkts = (double)(udp ? b->udp_packets : b->tcp_packets);
+        double t0 = sec_offset(b->sec, ax->t_start);
+        double px = timeline_px(ax, t0 + span / 2.0);
+        double py = timeline_py(ax, pkts / span);
+
+        if (i == 0) {
+            cairo_move_to(cr, px, py);
+            continue;
+        }
+
+        const ts_bucket_t *prev = &stats->timeline[i - 1];
+        if (bucket_gap_before(prev, b)) {
+            double prev_end = sec_offset(prev->sec, ax->t_start) +
+                              (double)bucket_span(prev);
+            cairo_line_to(cr, timeline_px(ax, prev_end), base_y);
+            cairo_line_to(cr, timeline_px(ax, t0), base_y);
+        }
+        cairo_line_to(cr, px, py);
+    }
+    cairo_stroke(cr);
+}
+
+/* -------------------------------------------------------------------
  * Reusable Vector Drawing Implementations
  * ------------------------------------------------------------------- */
 
@@ -227,8 +458,7 @@ int chart_draw_traffic_timeline(cairo_t *cr, const stats_ctx_t *stats,
     if (stats->timeline_count == 0 || !stats->timeline) {
         draw_empty_placeholder(cr, x, y, width, height, title_text,
                                "No timeline data available");
-        cairo_restore(cr);
-        return PCAPSTAT_OK;
+        return finish_draw(cr);
     }
 
     /* Fill background */
@@ -259,7 +489,7 @@ int chart_draw_traffic_timeline(cairo_t *cr, const stats_ctx_t *stats,
     double max_rate = 0.0;
     for (size_t i = 0; i < stats->timeline_count; i++) {
         const ts_bucket_t *b = &stats->timeline[i];
-        double span = (b->span_sec > 0) ? (double)b->span_sec : 1.0;
+        double span = (double)bucket_span(b);
         double tcp_r = (double)b->tcp_packets / span;
         double udp_r = (double)b->udp_packets / span;
         if (tcp_r > max_rate) {
@@ -298,7 +528,7 @@ int chart_draw_traffic_timeline(cairo_t *cr, const stats_ctx_t *stats,
 
         /* Y-tick label */
         char lbl[32];
-        format_metric(lbl, sizeof(lbl), tick_val);
+        format_axis_tick(lbl, sizeof(lbl), tick_val);
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lbl, &ext);
         cairo_set_source_rgb(cr, COLOR_TEXT_LABEL_R, COLOR_TEXT_LABEL_G, COLOR_TEXT_LABEL_B);
@@ -307,13 +537,18 @@ int chart_draw_traffic_timeline(cairo_t *cr, const stats_ctx_t *stats,
         cairo_show_text(cr, lbl);
     }
 
-    /* Time range for X-axis */
-    int64_t t_start = stats->timeline[0].sec;
-    int64_t t_end = stats->timeline[stats->timeline_count - 1].sec +
-                    (int64_t)stats->timeline[stats->timeline_count - 1].span_sec;
-    double t_total = (double)(t_end - t_start);
-    if (t_total <= 0.0) {
-        t_total = 1.0;
+    /* Time range for X-axis: from the first bucket's start to the last
+     * bucket's end, computed without signed overflow (see sec_offset). */
+    const ts_bucket_t *first = &stats->timeline[0];
+    const ts_bucket_t *last = &stats->timeline[stats->timeline_count - 1];
+    timeline_axes_t ax = {
+        .x = plot_x, .y = plot_y, .w = plot_w, .h = plot_h,
+        .t_start = first->sec,
+        .t_total = sec_offset(last->sec, first->sec) + (double)bucket_span(last),
+        .y_max = nice_max
+    };
+    if (!(ax.t_total > 0.0)) {
+        ax.t_total = 1.0;
     }
 
     /* Draw X-axis tick labels */
@@ -321,7 +556,7 @@ int chart_draw_traffic_timeline(cairo_t *cr, const stats_ctx_t *stats,
     for (int i = 0; i <= num_x_ticks; i++) {
         double frac = (double)i / (double)num_x_ticks;
         double grid_x = plot_x + plot_w * frac;
-        double offset_sec = t_total * frac;
+        double offset_sec = ax.t_total * frac;
 
         /* Subtle vertical gridline */
         cairo_set_source_rgb(cr, COLOR_GRID_R, COLOR_GRID_G, COLOR_GRID_B);
@@ -330,70 +565,44 @@ int chart_draw_traffic_timeline(cairo_t *cr, const stats_ctx_t *stats,
         cairo_line_to(cr, grid_x, plot_y + plot_h);
         cairo_stroke(cr);
 
-        /* X-tick label */
-        char lbl[32];
-        int sec_int = (int)offset_sec;
-        if (sec_int < 60) {
-            snprintf(lbl, sizeof(lbl), "+%ds", sec_int);
-        } else {
-            snprintf(lbl, sizeof(lbl), "%02d:%02d", sec_int / 60, sec_int % 60);
-        }
+        /* X-tick label, kept inside the bounding box so the long
+         * day-scale labels at the edges are not clipped. */
+        char lbl[48];
+        format_time_offset(lbl, sizeof(lbl), offset_sec, ax.t_total);
 
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lbl, &ext);
+        double lbl_x = grid_x - (ext.width / 2.0 + ext.x_bearing);
+        double lbl_max_x = x + width - 4.0 * scale - (ext.width + ext.x_bearing);
+        double lbl_min_x = x + 4.0 * scale - ext.x_bearing;
+        if (lbl_x > lbl_max_x) {
+            lbl_x = lbl_max_x;
+        }
+        if (lbl_x < lbl_min_x) {
+            lbl_x = lbl_min_x;
+        }
         cairo_set_source_rgb(cr, COLOR_TEXT_LABEL_R, COLOR_TEXT_LABEL_G, COLOR_TEXT_LABEL_B);
-        cairo_move_to(cr, grid_x - (ext.width / 2.0 + ext.x_bearing),
-                          plot_y + plot_h + 14.0 * scale);
+        cairo_move_to(cr, lbl_x, plot_y + plot_h + 14.0 * scale);
         cairo_show_text(cr, lbl);
     }
+
+    /* Plot area border, drawn before the series: on long captures a
+     * one-second bucket at either end is a vertical spike lying exactly
+     * on the frame and must not be hidden by it. */
+    cairo_set_source_rgb(cr, COLOR_AXIS_R, COLOR_AXIS_G, COLOR_AXIS_B);
+    cairo_set_line_width(cr, 1.0);
+    cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
+    cairo_stroke(cr);
 
     /* Plot TCP line (Blue) */
     cairo_set_source_rgb(cr, COLOR_TCP_R, COLOR_TCP_G, COLOR_TCP_B);
     cairo_set_line_width(cr, 2.0 * scale);
-    for (size_t i = 0; i < stats->timeline_count; i++) {
-        const ts_bucket_t *b = &stats->timeline[i];
-        double span = (b->span_sec > 0) ? (double)b->span_sec : 1.0;
-        double rate = (double)b->tcp_packets / span;
-        double t_mid = (double)(b->sec - t_start) + span / 2.0;
-        double px = plot_x + (t_mid / t_total) * plot_w;
-        double py = plot_y + plot_h - (rate / nice_max) * plot_h;
-
-        if (px < plot_x) px = plot_x;
-        if (px > plot_x + plot_w) px = plot_x + plot_w;
-        if (py < plot_y) py = plot_y;
-        if (py > plot_y + plot_h) py = plot_y + plot_h;
-
-        if (i == 0) {
-            cairo_move_to(cr, px, py);
-        } else {
-            cairo_line_to(cr, px, py);
-        }
-    }
-    cairo_stroke(cr);
+    stroke_rate_series(cr, stats, &ax, false);
 
     /* Plot UDP line (Orange) */
     cairo_set_source_rgb(cr, COLOR_UDP_R, COLOR_UDP_G, COLOR_UDP_B);
     cairo_set_line_width(cr, 2.0 * scale);
-    for (size_t i = 0; i < stats->timeline_count; i++) {
-        const ts_bucket_t *b = &stats->timeline[i];
-        double span = (b->span_sec > 0) ? (double)b->span_sec : 1.0;
-        double rate = (double)b->udp_packets / span;
-        double t_mid = (double)(b->sec - t_start) + span / 2.0;
-        double px = plot_x + (t_mid / t_total) * plot_w;
-        double py = plot_y + plot_h - (rate / nice_max) * plot_h;
-
-        if (px < plot_x) px = plot_x;
-        if (px > plot_x + plot_w) px = plot_x + plot_w;
-        if (py < plot_y) py = plot_y;
-        if (py > plot_y + plot_h) py = plot_y + plot_h;
-
-        if (i == 0) {
-            cairo_move_to(cr, px, py);
-        } else {
-            cairo_line_to(cr, px, py);
-        }
-    }
-    cairo_stroke(cr);
+    stroke_rate_series(cr, stats, &ax, true);
 
     /* Draw Legend at top right */
     double leg_x = plot_x + plot_w - 130.0 * scale;
@@ -419,14 +628,7 @@ int chart_draw_traffic_timeline(cairo_t *cr, const stats_ctx_t *stats,
     cairo_move_to(cr, leg2_x + 14.0 * scale, leg_y + 9.0 * scale);
     cairo_show_text(cr, "UDP");
 
-    /* Plot area border */
-    cairo_set_source_rgb(cr, COLOR_AXIS_R, COLOR_AXIS_G, COLOR_AXIS_B);
-    cairo_set_line_width(cr, 1.0);
-    cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
-    cairo_stroke(cr);
-
-    cairo_restore(cr);
-    return PCAPSTAT_OK;
+    return finish_draw(cr);
 }
 
 int chart_draw_protocol_ports(cairo_t *cr, const stats_ctx_t *stats,
@@ -449,8 +651,7 @@ int chart_draw_protocol_ports(cairo_t *cr, const stats_ctx_t *stats,
     if (count == 0) {
         draw_empty_placeholder(cr, x, y, width, height, title_text,
                                "No destination port data available");
-        cairo_restore(cr);
-        return PCAPSTAT_OK;
+        return finish_draw(cr);
     }
 
     /* Fill background */
@@ -461,8 +662,29 @@ int chart_draw_protocol_ports(cairo_t *cr, const stats_ctx_t *stats,
     double scale = get_ui_scale(width);
     draw_chart_title(cr, x, y, scale, title_text);
 
-    /* Margins: left margin holds service names e.g. "443 (HTTPS)" */
+    /* Bar labels, e.g. "443/tcp (HTTPS)", measured at the label font size */
+    char port_lbls[10][64];
+    double max_lbl_w = 0.0;
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 9.5 * scale);
+    for (size_t i = 0; i < count; i++) {
+        format_port_label(port_lbls[i], sizeof(port_lbls[i]), top_ports[i]);
+        cairo_text_extents_t lbl_ext;
+        cairo_text_extents(cr, port_lbls[i], &lbl_ext);
+        if (lbl_ext.x_advance > max_lbl_w) {
+            max_lbl_w = lbl_ext.x_advance;
+        }
+    }
+
+    /* Margins: the left margin holds the port labels; widen it when the
+     * longest label needs more room, keeping most of the box for bars. */
     double margin_left = 110.0 * scale;
+    if (max_lbl_w + 16.0 * scale > margin_left) {
+        margin_left = max_lbl_w + 16.0 * scale;
+    }
+    if (margin_left > width * 0.45) {
+        margin_left = width * 0.45;
+    }
     double margin_right = 50.0 * scale;
     double margin_top = 45.0 * scale;
     double margin_bottom = 30.0 * scale;
@@ -501,7 +723,7 @@ int chart_draw_protocol_ports(cairo_t *cr, const stats_ctx_t *stats,
 
         /* X-tick label */
         char lbl[32];
-        format_metric(lbl, sizeof(lbl), tick_val);
+        format_axis_tick(lbl, sizeof(lbl), tick_val);
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lbl, &ext);
         cairo_set_source_rgb(cr, COLOR_TEXT_LABEL_R, COLOR_TEXT_LABEL_G, COLOR_TEXT_LABEL_B);
@@ -519,9 +741,7 @@ int chart_draw_protocol_ports(cairo_t *cr, const stats_ctx_t *stats,
 
     for (size_t i = 0; i < count; i++) {
         const port_stats_t *p = top_ports[i];
-        const char *svc = stats_port_service_name(p->proto, p->dst_port);
-        char port_lbl[64];
-        snprintf(port_lbl, sizeof(port_lbl), "%u (%s)", (unsigned)p->dst_port, svc);
+        const char *port_lbl = port_lbls[i];
 
         double bar_y = plot_y + i * slot_h + (slot_h - bar_h) / 2.0;
         double bar_w = ((double)p->packets / nice_max) * plot_w;
@@ -562,8 +782,7 @@ int chart_draw_protocol_ports(cairo_t *cr, const stats_ctx_t *stats,
     cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
     cairo_stroke(cr);
 
-    cairo_restore(cr);
-    return PCAPSTAT_OK;
+    return finish_draw(cr);
 }
 
 int chart_draw_packet_sizes(cairo_t *cr, const stats_ctx_t *stats,
@@ -582,8 +801,7 @@ int chart_draw_packet_sizes(cairo_t *cr, const stats_ctx_t *stats,
     if (stats->total_packets == 0) {
         draw_empty_placeholder(cr, x, y, width, height, title_text,
                                "No packets in capture");
-        cairo_restore(cr);
-        return PCAPSTAT_OK;
+        return finish_draw(cr);
     }
 
     /* Fill background */
@@ -638,7 +856,7 @@ int chart_draw_packet_sizes(cairo_t *cr, const stats_ctx_t *stats,
         cairo_stroke(cr);
 
         char lbl[32];
-        format_metric(lbl, sizeof(lbl), tick_val);
+        format_axis_tick(lbl, sizeof(lbl), tick_val);
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lbl, &ext);
         cairo_set_source_rgb(cr, COLOR_TEXT_LABEL_R, COLOR_TEXT_LABEL_G, COLOR_TEXT_LABEL_B);
@@ -647,6 +865,8 @@ int chart_draw_packet_sizes(cairo_t *cr, const stats_ctx_t *stats,
         cairo_show_text(cr, lbl);
     }
 
+    /* Bins (frame wire length): [0,64) [64,128) [128,256) [256,512)
+     * [512,1024) [1024,1514) [1514,inf), see STATS_PACKET_SIZE_BINS. */
     static const char *bin_labels[STATS_PACKET_SIZE_BINS] = {
         "<64", "64-127", "128-255", "256-511", "512-1023", "1024-1513", ">=1514"
     };
@@ -697,8 +917,7 @@ int chart_draw_packet_sizes(cairo_t *cr, const stats_ctx_t *stats,
     cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
     cairo_stroke(cr);
 
-    cairo_restore(cr);
-    return PCAPSTAT_OK;
+    return finish_draw(cr);
 }
 
 int chart_draw_tcp_flags(cairo_t *cr, const stats_ctx_t *stats,
@@ -717,8 +936,7 @@ int chart_draw_tcp_flags(cairo_t *cr, const stats_ctx_t *stats,
     if (stats->tcp_packets == 0) {
         draw_empty_placeholder(cr, x, y, width, height, title_text,
                                "No TCP packets in capture");
-        cairo_restore(cr);
-        return PCAPSTAT_OK;
+        return finish_draw(cr);
     }
 
     /* Fill background */
@@ -745,22 +963,27 @@ int chart_draw_tcp_flags(cairo_t *cr, const stats_ctx_t *stats,
         return PCAPSTAT_ERR_ARGS;
     }
 
-    static const char *flag_names[7] = {
-        "SYN", "SYN-ACK", "ACK", "FIN", "RST", "PSH", "URG"
+    static const char *flag_names[TCP_FLAG_BARS] = {
+        "SYN", "SYN-ACK", "ACK", "FIN", "RST", "PSH", "URG", "Suspicious"
     };
 
-    uint64_t counts[7] = {
+    /* "Suspicious" = flag combinations that never occur in legitimate
+     * traffic: NULL + Xmas + SYN+FIN + SYN+RST (same sum as the report's
+     * flag table; a SYN+FIN+RST packet is in both SYN terms). */
+    uint64_t counts[TCP_FLAG_BARS] = {
         stats->syn,
         stats->syn_ack,
         stats->ack,
         stats->fin,
         stats->rst,
         stats->psh,
-        stats->urg
+        stats->urg,
+        stats->null_scan_pkts + stats->xmas_scan_pkts +
+            stats->syn_fin_pkts + stats->syn_rst_pkts
     };
 
     uint64_t max_count = 0;
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < TCP_FLAG_BARS; i++) {
         if (counts[i] > max_count) {
             max_count = counts[i];
         }
@@ -786,7 +1009,7 @@ int chart_draw_tcp_flags(cairo_t *cr, const stats_ctx_t *stats,
         cairo_stroke(cr);
 
         char lbl[32];
-        format_metric(lbl, sizeof(lbl), tick_val);
+        format_axis_tick(lbl, sizeof(lbl), tick_val);
         cairo_text_extents_t ext;
         cairo_text_extents(cr, lbl, &ext);
         cairo_set_source_rgb(cr, COLOR_TEXT_LABEL_R, COLOR_TEXT_LABEL_G, COLOR_TEXT_LABEL_B);
@@ -796,10 +1019,10 @@ int chart_draw_tcp_flags(cairo_t *cr, const stats_ctx_t *stats,
     }
 
     /* Draw vertical flag bars */
-    double slot_w = plot_w / 7.0;
+    double slot_w = plot_w / (double)TCP_FLAG_BARS;
     double bar_w = slot_w * 0.62;
 
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < TCP_FLAG_BARS; i++) {
         double bar_h = ((double)counts[i] / nice_max) * plot_h;
         double bar_x = plot_x + i * slot_w + (slot_w - bar_w) / 2.0;
         double bar_y = plot_y + plot_h - bar_h;
@@ -842,8 +1065,7 @@ int chart_draw_tcp_flags(cairo_t *cr, const stats_ctx_t *stats,
     cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
     cairo_stroke(cr);
 
-    cairo_restore(cr);
-    return PCAPSTAT_OK;
+    return finish_draw(cr);
 }
 
 /* -------------------------------------------------------------------
@@ -890,6 +1112,15 @@ static int export_chart_to_png(const stats_ctx_t *stats,
         goto cleanup;
     }
 
+    /* A failed Cairo operation puts the context (or surface) into a
+     * sticky error state and turns later drawing into no-ops. */
+    cairo_surface_flush(surface);
+    if (cairo_status(cr) != CAIRO_STATUS_SUCCESS ||
+        cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        rc = PCAPSTAT_ERR_RENDER;
+        goto cleanup;
+    }
+
     cairo_status_t write_status = cairo_surface_write_to_png(surface, file_path);
     if (write_status != CAIRO_STATUS_SUCCESS) {
         rc = PCAPSTAT_ERR_IO;
@@ -932,6 +1163,35 @@ int chart_export_tcp_flags_png(const stats_ctx_t *stats,
     return export_chart_to_png(stats, file_path, width, height, chart_draw_tcp_flags);
 }
 
+/**
+ * @brief Build "<dir>/<name>" into @p buf, ignoring trailing slashes of
+ *        @p dir ("out/" and "out" give "out/<name>"; "/" gives "/<name>").
+ *
+ * Same rule as join_path() in main.c, so the files written here match the
+ * paths main prints.
+ *
+ * @return PCAPSTAT_OK, or PCAPSTAT_ERR_ARGS if @p dir is empty or the
+ *         result does not fit in @p buf_len bytes.
+ */
+static int join_output_path(char *buf, size_t buf_len, const char *dir,
+                            const char *name)
+{
+    size_t dlen = strlen(dir);
+    while (dlen > 1 && dir[dlen - 1] == '/') {
+        dlen--;
+    }
+    if (dlen == 0 || dlen >= buf_len) {
+        return PCAPSTAT_ERR_ARGS;
+    }
+
+    const char *sep = (dlen == 1 && dir[0] == '/') ? "" : "/";
+    int n = snprintf(buf, buf_len, "%.*s%s%s", (int)dlen, dir, sep, name);
+    if (n < 0 || (size_t)n >= buf_len) {
+        return PCAPSTAT_ERR_ARGS;
+    }
+    return PCAPSTAT_OK;
+}
+
 int charts_generate_all(const stats_ctx_t *stats, const char *output_dir)
 {
     if (!stats || !output_dir) {
@@ -939,22 +1199,21 @@ int charts_generate_all(const stats_ctx_t *stats, const char *output_dir)
     }
 
     char path[PCAPSTAT_MAX_PATH];
-    int n;
 
     /* 1. Traffic Timeline */
-    n = snprintf(path, sizeof(path), "%s/%s", output_dir, CHART_FILE_TRAFFIC_TIMELINE);
-    if (n < 0 || (size_t)n >= sizeof(path)) {
-        return PCAPSTAT_ERR_ARGS;
+    int rc = join_output_path(path, sizeof(path), output_dir, CHART_FILE_TRAFFIC_TIMELINE);
+    if (rc != PCAPSTAT_OK) {
+        return rc;
     }
-    int rc = chart_export_traffic_timeline_png(stats, path, 0, 0);
+    rc = chart_export_traffic_timeline_png(stats, path, 0, 0);
     if (rc != PCAPSTAT_OK) {
         return rc;
     }
 
     /* 2. Top Destination Ports */
-    n = snprintf(path, sizeof(path), "%s/%s", output_dir, CHART_FILE_PROTOCOL_PORTS);
-    if (n < 0 || (size_t)n >= sizeof(path)) {
-        return PCAPSTAT_ERR_ARGS;
+    rc = join_output_path(path, sizeof(path), output_dir, CHART_FILE_PROTOCOL_PORTS);
+    if (rc != PCAPSTAT_OK) {
+        return rc;
     }
     rc = chart_export_protocol_ports_png(stats, path, 0, 0);
     if (rc != PCAPSTAT_OK) {
@@ -962,9 +1221,9 @@ int charts_generate_all(const stats_ctx_t *stats, const char *output_dir)
     }
 
     /* 3. Packet Sizes Histogram */
-    n = snprintf(path, sizeof(path), "%s/%s", output_dir, CHART_FILE_PACKET_SIZES);
-    if (n < 0 || (size_t)n >= sizeof(path)) {
-        return PCAPSTAT_ERR_ARGS;
+    rc = join_output_path(path, sizeof(path), output_dir, CHART_FILE_PACKET_SIZES);
+    if (rc != PCAPSTAT_OK) {
+        return rc;
     }
     rc = chart_export_packet_sizes_png(stats, path, 0, 0);
     if (rc != PCAPSTAT_OK) {
@@ -972,9 +1231,9 @@ int charts_generate_all(const stats_ctx_t *stats, const char *output_dir)
     }
 
     /* 4. TCP Flags */
-    n = snprintf(path, sizeof(path), "%s/%s", output_dir, CHART_FILE_TCP_FLAGS);
-    if (n < 0 || (size_t)n >= sizeof(path)) {
-        return PCAPSTAT_ERR_ARGS;
+    rc = join_output_path(path, sizeof(path), output_dir, CHART_FILE_TCP_FLAGS);
+    if (rc != PCAPSTAT_OK) {
+        return rc;
     }
     rc = chart_export_tcp_flags_png(stats, path, 0, 0);
     if (rc != PCAPSTAT_OK) {
