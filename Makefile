@@ -71,7 +71,7 @@ ALL_DEPS := $(wildcard $(BUILDDIR)/*/*.d)
 REL_CFLAGS  := $(COMMON_CFLAGS) -O2 $(HARDEN_CFLAGS)
 DBG_CFLAGS  := $(COMMON_CFLAGS) -g -O0 $(WERROR)
 ASAN_CFLAGS := $(COMMON_CFLAGS) -g -O1 $(WERROR) $(SANITIZE) -fno-omit-frame-pointer
-TEST_CFLAGS := $(COMMON_CFLAGS) -g -O1 $(SANITIZE) -fno-omit-frame-pointer
+TEST_CFLAGS := $(COMMON_CFLAGS) -g -O1 $(WERROR) $(SANITIZE) -fno-omit-frame-pointer
 # Generator: compiled and linked in one step straight into bin/, so no
 # -MMD (it would leave a stray bin/gen_demo_pcap.d).
 GEN_CFLAGS  := $(BASE_CFLAGS) -g -O1 $(WERROR) $(SANITIZE) -fno-omit-frame-pointer
@@ -86,7 +86,7 @@ UNIT_UBSAN_OPTIONS := print_stacktrace=1:halt_on_error=1
 UNIT_LSAN_OPTIONS  := suppressions=$(CURDIR)/$(TESTDIR)/lsan.supp:print_suppressions=0
 
 # ── Phony targets ───────────────────────────────────────────────────
-.PHONY: all debug asan valgrind unit-test test clean gen-sample
+.PHONY: all debug asan valgrind unit-test test clean gen-sample fixtures
 
 # Keep intermediate objects (build/test/*.o): otherwise make deletes them
 # after linking the test binaries and `make test` ends with an `rm` line.
@@ -122,7 +122,7 @@ unit-test: $(TEST_BINS)
 # ── test (integration: run_tests.sh) ────────────────────────────────
 # Run through bash unconditionally: does not depend on the exec bit, and a
 # missing script fails the target instead of being skipped.
-test: all debug asan unit-test
+test: all debug asan unit-test fixtures
 	@echo "=== Running integration tests ==="
 	bash $(TESTDIR)/run_tests.sh
 
@@ -141,6 +141,17 @@ $(GEN_BIN): $(GEN_SRC) | $(BINDIR)
 
 samples:
 	mkdir -p samples
+
+# ── fixtures (edge-case captures for run_tests.sh) ───────────────────
+# Only the generator is built here; run_tests.sh runs it into its own
+# temporary directory, so no capture files land in the tree.
+FIXTURE_SRC := $(TESTDIR)/gen_fixture_pcaps.c
+FIXTURE_BIN := $(BINDIR)/gen_fixture_pcaps
+
+fixtures: $(FIXTURE_BIN)
+
+$(FIXTURE_BIN): $(FIXTURE_SRC) | $(BINDIR)
+	$(CC) $(GEN_CFLAGS) -I$(INCDIR) $(GEN_LDFLAGS) -o $@ $< $(PCAP_LIBS)
 
 # ── clean ────────────────────────────────────────────────────────────
 clean:
